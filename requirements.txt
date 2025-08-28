@@ -1,0 +1,6 @@
+beautifulsoup4
+streamlit
+supabase
+python-dotenv
+openai>=1.30.0
+requests
