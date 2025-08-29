@@ -4,3 +4,11 @@ supabase
 python-dotenv
 openai>=1.30.0
 requests
+llama-cpp-python
+ollama
+chromadb
+tiktoken
+langchain
+fastapi
+uvicorn
+pydantic

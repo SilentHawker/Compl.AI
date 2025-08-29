@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timezone
 import json
 from openai import OpenAI
+import hashlib
 
 FINTRAC_URL = "https://fintrac-canafe.canada.ca/msb-esm/msb-eng"
 TITLE = "MSB Obligations"
@@ -59,8 +60,25 @@ def get_existing(sb: Client):
         .eq("source", SOURCE).eq("title", TITLE).execute()
     return res.data[0] if res.data else None
 
+def upsert_with_version(sb, title, url, lang, category, content, content_hash, change_summary=None):
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "p_source": "FINTRAC",
+        "p_url": url,
+        "p_title": title,
+        "p_category": category,
+        "p_lang": lang,
+        "p_jurisdiction": "Canada",
+        "p_content": content,
+        "p_content_hash": content_hash,
+        "p_last_fetched": now,
+        "p_change_summary": change_summary or {}
+    }
+    sb.rpc("upsert_regulation_with_version", payload).execute()
+
 def upsert_regulation(sb: Client, content: str, dry_run: bool=False):
     now = datetime.now(timezone.utc).isoformat()
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
     payload = {
         "title": TITLE,
@@ -70,14 +88,23 @@ def upsert_regulation(sb: Client, content: str, dry_run: bool=False):
         "content": content,
         "last_updated": now
     }
+
     if dry_run:
-        print("🧪 [DRY-RUN] Would upsert:", {k: payload[k] for k in ["title","source","jurisdiction","category"]})
+        print("🧪 [DRY-RUN] Would upsert:", {k: payload[k] for k in ["title", "source", "jurisdiction", "category"]})
         print(f"🧪 [DRY-RUN] Content length: {len(content)} chars")
         return
 
-    # Upsert by unique (source, title)
-    sb.table("regulations").upsert(payload, on_conflict="source,title").execute()
-    print("✅ Upserted current FINTRAC MSB content.")
+    # Use the new upsert_with_version function
+    upsert_with_version(
+        sb=sb,
+        title=TITLE,
+        url=FINTRAC_URL,
+        lang="en",
+        category="MSB",
+        content=content,
+        content_hash=content_hash
+    )
+    print("✅ Upserted current FINTRAC MSB content with versioning.")
 
 def summarize_meaningful_diff(old_text: str, new_text: str) -> dict:
     """Returns STRICT JSON about policy-relevant changes, or {"is_meaningful_change": false}."""
