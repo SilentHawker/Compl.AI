@@ -4,6 +4,7 @@ from datetime import datetime
 import streamlit as st
 from supabase import create_client, Client
 from dotenv import load_dotenv
+import bcrypt
 
 # ---- Streamlit compatibility shims (new & old APIs) ----
 import streamlit as st
@@ -50,7 +51,7 @@ st.set_page_config(page_title="ComplianceAI", layout="wide")
 
 # Try to import your real generator; otherwise stub so UI still runs
 try:
-    from policy_generator import generate_policy_for_client
+    from policy_gen import generate_policy_for_client
     HAVE_GENERATOR = True
 except Exception:
     HAVE_GENERATOR = False
@@ -94,6 +95,22 @@ def get_client_by_token(tok):
     res = (sb.table("clients")
            .select("id,company_name,province,language,portal_enabled")
            .eq("portal_token", tok).limit(1).execute())
+    return res.data[0] if res.data else None
+
+def get_client_by_username(username):
+    if not username: return None
+    res = (sb.table("clients")
+           .select("id,company_name,province,language,portal_enabled,portal_pass")
+           .eq("portal_user", username).limit(1).execute())
+    st.write(f"Debug: Query result for username '{username}': {res.data}")
+    return res.data[0] if res.data else None
+
+def get_client_by_id(client_id: str):
+    res = (sb.table("clients")
+           .select("id,company_name,province,language,portal_enabled")
+           .eq("id", client_id)
+           .limit(1)
+           .execute())
     return res.data[0] if res.data else None
 
 def get_policies_by_client(client_id):
@@ -140,13 +157,18 @@ def show_login():
                 st.session_state["role"] = "admin"
                 st.success("Logged in as admin.")
                 time.sleep(0.3)
-                st.experimental_rerun()
-            elif role == "client" and u == CLIENT_USER and p == CLIENT_PASS:
-                st.session_state["authed"] = True
-                st.session_state["role"] = "client"
-                st.success("Logged in as client.")
-                time.sleep(0.3)
-                st.experimental_rerun()
+                _rerun()
+            elif role == "client":
+                client = get_client_by_username(u)
+                st.write(f"Debug: Client fetched: {client}")
+                if client and client.get("portal_enabled", True) and p.lower() == client.get("portal_pass", "").lower():
+                    st.session_state["authed"] = True
+                    st.session_state["role"] = "client"
+                    st.session_state["client_id"] = client["id"]  # <-- bind to a specific client
+                    st.success(f"Logged in as client: {client['company_name']}")
+                    _rerun()
+                else:
+                    st.error("Invalid client credentials or portal disabled")
             else:
                 st.error("Invalid credentials")
 
@@ -163,7 +185,7 @@ def logout_button():
         st.session_state.clear()
         st.success("Logged out.")
         time.sleep(0.3)
-        st.experimental_rerun()
+        _rerun()
 
 # ------------------ ADMIN UI ------------------
 def admin_ui():
@@ -177,8 +199,8 @@ def admin_ui():
         st.subheader("Add a customer")
         with st.form("add_client"):
             name = st.text_input("Company name", "")
-            prov = st.selectbox("Province", ["QC","ON","BC","AB","MB","SK","NB","NS","NL","PE","YT","NT","NU"], index=1)
-            lang = st.selectbox("Language", ["en","fr"], index=0)
+            prov = st.selectbox("Province", ["QC", "ON", "BC", "AB", "MB", "SK", "NB", "NS", "NL", "PE", "YT", "NT", "NU"], index=1)
+            lang = st.selectbox("Language", ["en", "fr"], index=0)
             submitted = st.form_submit_button("Save")
             if submitted:
                 if not name.strip():
@@ -187,7 +209,7 @@ def admin_ui():
                     add_client(name.strip(), prov, lang)
                     st.success(f"Saved: {name}")
                     time.sleep(0.4)
-                    st.experimental_rerun()
+                    _rerun()
 
         st.markdown("### All customers")
         clients = list_clients()
@@ -198,21 +220,21 @@ def admin_ui():
                 with st.container(border=True):
                     st.subheader(c["company_name"])
                     st.caption(f"{c['province']} • {c['language']} • Added {ts(c['created_at'])}")
-                    col1, col2, col3 = st.columns([2,2,2])
+                    col1, col2, col3 = st.columns([2, 2, 2])
 
                     with col1:
                         enabled = "✅ enabled" if c.get("portal_enabled") else "❌ disabled"
                         st.text(f"Client portal: {enabled}")
-                        link = f"{PORTAL_BASE}/?token={c.get('portal_token','')}"
+                        link = f"{PORTAL_BASE}/?token={c.get('portal_token', '')}"
                         st.code(link, language="text")
-                        if st.button(f"Rotate link", key="rot_"+c["id"]):
+                        if st.button(f"Rotate link", key="rot_" + c["id"]):
                             new_tok = rotate_token_python(c["id"])
                             st.success("Link rotated.")
                             st.code(f"{PORTAL_BASE}/?token={new_tok}", language="text")
 
                     with col2:
-                        lang_sel = st.selectbox(f"Language for {c['company_name']}", ["en","fr"], index=0, key="lang_"+c["id"])
-                        if st.button(f"Generate policy", key="gen_"+c["id"]):
+                        lang_sel = st.selectbox(f"Language for {c['company_name']}", ["en", "fr"], index=0, key="lang_" + c["id"])
+                        if st.button(f"Generate policy", key="gen_" + c["id"]):
                             if HAVE_GENERATOR:
                                 with st.spinner("Generating…"):
                                     md = generate_policy_for_client(c["company_name"], preferred_language=lang_sel)
@@ -229,6 +251,23 @@ def admin_ui():
                                 st.caption(f"• {p['regulation_title']} [{p['language']}] via {p['ai_model']} · {ts(p['generated_at'])}")
                         else:
                             st.caption("No policies yet.")
+
+                    # Add portal access management
+                    with st.expander("Portal access"):
+                        cur_user = c.get("portal_user") or ""
+                        cur_enabled = bool(c.get("portal_enabled"))
+                        u = st.text_input(f"Username for {c['company_name']}", value=cur_user, key=f"pu_{c['id']}")
+                        p = st.text_input("Password", value="", type="password", key=f"pp_{c['id']}")
+                        en = st.checkbox("Enabled", value=cur_enabled, key=f"pe_{c['id']}")
+                        if st.button("Save portal creds", key=f"savep_{c['id']}"):
+                            if not u.strip():
+                                st.error("Username required.")
+                            elif not p and not cur_user:
+                                st.error("Password required for first-time setup.")
+                            else:
+                                set_client_portal_creds(c["id"], u.strip(), p or (c.get("portal_pass") or ""), en)
+                                st.success("Portal credentials saved.")
+                                _rerun()
 
     # ---------- Policies ----------
     with tab2:
@@ -336,24 +375,54 @@ def admin_ui():
                         diff_text = "\n".join(diff) or "(No differences)"
                         st.code(diff_text, language="diff")
 
+    # Add a section to set portal credentials
+    st.subheader("Set Client Portal Credentials")
+    clients = list_clients()
+    client_names = {c["company_name"]: c["id"] for c in clients}
+    selected_client = st.selectbox("Select Client", list(client_names.keys()))
+    client_id = client_names[selected_client]
+
+    user = st.text_input("Portal Username", "")
+    pwd = st.text_input("Portal Password", "", type="password")
+    enabled = st.checkbox("Enable Portal", value=True)
+
+    if st.button("Set Credentials"):
+        if user.strip() and pwd:
+            set_client_portal_creds(client_id, user, pwd, enabled)
+            st.success(f"Portal credentials updated for {selected_client}")
+        else:
+            st.error("Username and password are required.")
+
 # ------------------ CLIENT UI ------------------
 def client_ui():
     st.title("Client Portal")
     logout_button()
 
-    st.caption("Private access. Use your portal link.")
-    qp = st.experimental_get_query_params()
-    token = (qp.get("token") or [None])[0]
+    # Prefer session-bound client (username-bound login)
+    bound_id = st.session_state.get("client_id")
+    client = None
+    if bound_id:
+        client = get_client_by_id(bound_id)
 
-    if not token:
-        st.warning("Missing portal token. Paste it below.")
-        token = st.text_input("Portal token (from admin link)", "")
-        if token:
-            st.experimental_set_query_params(token=token)
-            st.experimental_rerun()
-        st.stop()
+    # Fallback to token flow only if not bound by username/password
+    if not client:
+        st.caption("Private access. Use your portal link.")
+        qp = _get_qp()
+        token = qp.get("token")
+        if isinstance(token, list):
+            token = token[0] if token else None
 
-    client = get_client_by_token(token)
+        if not token:
+            st.warning("Missing portal token. Paste it below.")
+            t_in = st.text_input("Portal token (from admin link)", "")
+            if t_in:
+                qp["token"] = t_in
+                _set_qp(qp)
+                _rerun()
+            st.stop()
+
+        client = get_client_by_token(token)
+
     if not client:
         st.error("Invalid or expired portal link.")
         st.stop()
@@ -361,9 +430,11 @@ def client_ui():
         st.error("This portal is disabled. Contact your admin.")
         st.stop()
 
+    # Display client details
     st.subheader(client["company_name"])
     st.caption(f"Province: {client['province']} • Language: {client['language']}")
 
+    # Show policies
     rows = get_policies_by_client(client["id"])
     if rows:
         st.markdown("### Your Policies")
@@ -382,9 +453,10 @@ def client_ui():
     else:
         st.info("No policies yet for your organization.")
 
+    # Generate a new policy
     st.markdown("---")
     st.subheader("Generate a new policy")
-    lang_sel = st.selectbox("Language", ["en","fr"], index=0)
+    lang_sel = st.selectbox("Language", ["en", "fr"], index=0)
     if st.button("Generate now"):
         if HAVE_GENERATOR:
             with st.spinner("Generating…"):
@@ -394,7 +466,7 @@ def client_ui():
                                file_name=f"{client['company_name']}_AML_Policy.md",
                                mime="text/markdown")
             time.sleep(0.4)
-            st.experimental_rerun()
+            _rerun()
         else:
             st.warning("The generator is not connected. Ask your admin to enable it.")
 
@@ -420,3 +492,9 @@ def show_login_and_route():
 
 if __name__ == "__main__":
     show_login_and_route()
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+def check_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
