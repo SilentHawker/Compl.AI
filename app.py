@@ -2,9 +2,9 @@
 import os, time, uuid
 from datetime import datetime
 import streamlit as st
-from supabase import create_client, Client
 from dotenv import load_dotenv
 import bcrypt
+import requests
 
 # ---- Streamlit compatibility shims (new & old APIs) ----
 import streamlit as st
@@ -45,7 +45,16 @@ CLIENT_PASS = os.getenv("CLIENT_PASS", "test123")
 # Where client portal links should point (same app is fine)
 PORTAL_BASE = os.getenv("CLIENT_PORTAL_BASE_URL", "http://localhost:8501")
 
-sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Use centralized DB helpers
+from db_utils import (
+    sb,
+    list_clients as db_list_clients,
+    list_policies as db_list_policies,
+    get_client_by_token as db_get_client_by_token,
+    get_client_by_username as db_get_client_by_username,
+    get_client_by_id as db_get_client_by_id,
+    get_client_by_name as db_get_client_by_name,
+)
 
 st.set_page_config(page_title="ComplianceAI", layout="wide")
 
@@ -66,21 +75,27 @@ def ts(s):
     except Exception:
         return s
 
+# Delegates to db_utils (avoid reimplementations)
 def list_clients():
-    return (sb.table("clients")
-             .select("id,company_name,province,language,created_at,portal_token,portal_enabled")
-             .order("company_name").execute().data or [])
-
-def list_sources():
-    return (sb.table("regulations")
-             .select("id,title,source,category,url,last_fetched,last_updated,content_hash,current_version_no")
-             .order("title").execute().data or [])
+    return db_list_clients()
 
 def list_policies(client_id):
-    return (sb.table("policies")
-             .select("id,regulation_title,regulation_hash,generated_at,language,ai_model")
-             .eq("client_id", client_id)
-             .order("generated_at", desc=True).execute().data or [])
+    return db_list_policies(client_id)
+
+def get_client_by_token(tok):
+    return db_get_client_by_token(tok)
+
+def get_client_by_username(username):
+    # keep debug info in UI only
+    client = db_get_client_by_username(username)
+    st.write(f"Debug: Query result for username '{username}': {client}")
+    return client
+
+def get_client_by_id(client_id: str):
+    return db_get_client_by_id(client_id)
+
+def get_client_by_name(company_name: str):
+    return db_get_client_by_name(company_name)
 
 def add_client(name, prov, lang):
     sb.table("clients").insert({"company_name": name, "province": prov, "language": lang}).execute()
@@ -90,87 +105,43 @@ def rotate_token_python(client_id):
     sb.table("clients").update({"portal_token": new_tok}).eq("id", client_id).execute()
     return new_tok
 
-def get_client_by_token(tok):
-    if not tok: return None
-    res = (sb.table("clients")
-           .select("id,company_name,province,language,portal_enabled")
-           .eq("portal_token", tok).limit(1).execute())
-    return res.data[0] if res.data else None
-
-def get_client_by_username(username):
-    if not username: return None
-    res = (sb.table("clients")
-           .select("id,company_name,province,language,portal_enabled,portal_pass")
-           .eq("portal_user", username).limit(1).execute())
-    st.write(f"Debug: Query result for username '{username}': {res.data}")
-    return res.data[0] if res.data else None
-
-def get_client_by_id(client_id: str):
-    res = (sb.table("clients")
-           .select("id,company_name,province,language,portal_enabled")
-           .eq("id", client_id)
-           .limit(1)
-           .execute())
-    return res.data[0] if res.data else None
-
-def get_policies_by_client(client_id):
-    return (sb.table("policies")
-            .select("id,regulation_title,generated_at,language,ai_model")
-            .eq("client_id", client_id)
-            .order("generated_at", desc=True).execute().data or [])
-
-# -------- Versioning helpers --------
-def list_registrations_for_versions():
-    return (sb.table("regulations")
-             .select("id,title,source,category,url,current_version_no,last_updated,last_fetched")
-             .order("source", desc=False)
-             .order("title", desc=False)
-             .execute().data or [])
-
-def list_versions(regulation_id: str):
-    return (sb.table("regulation_versions")
-             .select("id,version_no,content_hash,scraped_at,change_summary")
-             .eq("regulation_id", regulation_id)
-             .order("version_no", desc=True)
-             .execute().data or [])
-
-def get_version_content_by_no(regulation_id: str, version_no: int):
-    rows = (sb.table("regulation_versions")
-              .select("id,content,content_hash,scraped_at,change_summary")
-              .eq("regulation_id", regulation_id)
-              .eq("version_no", version_no)
-              .limit(1)
-              .execute().data or [])
-    return rows[0] if rows else None
+# set_client_portal_creds now hashes password before storing
+def set_client_portal_creds(client_id: str, user: str, pwd: str, enabled: bool = True):
+    hashed = bcrypt.hashpw(pwd.encode("utf-8"), bcrypt.gensalt()).decode("utf-8") if pwd else (sb.table("clients").select("portal_pass").eq("id", client_id).limit(1).execute().data[0].get("portal_pass") if sb.table("clients").select("portal_pass").eq("id", client_id).limit(1).execute().data else "")
+    sb.table("clients").update({
+        "portal_user": user.strip(),
+        "portal_pass": hashed,
+        "portal_enabled": enabled
+    }).eq("id", client_id).execute()
 
 # ------------------ AUTH ------------------
 def show_login():
-    st.title("ComplianceAI — Sign in")
-    with st.form("login_form"):
-        u = st.text_input("Username", value="", autocomplete="username")
-        p = st.text_input("Password", value="", type="password", autocomplete="current-password")
-        role = st.selectbox("Login as", ["client", "admin"], index=0)
-        submitted = st.form_submit_button("Log in")
-        if submitted:
-            if role == "admin" and u == ADMIN_USER and p == ADMIN_PASS:
-                st.session_state["authed"] = True
-                st.session_state["role"] = "admin"
-                st.success("Logged in as admin.")
-                time.sleep(0.3)
-                _rerun()
-            elif role == "client":
+     st.title("ComplianceAI — Sign in")
+     with st.form("login_form"):
+         u = st.text_input("Username", value="", autocomplete="username")
+         p = st.text_input("Password", value="", type="password", autocomplete="current-password")
+         role = st.selectbox("Login as", ["client", "admin"], index=0)
+         submitted = st.form_submit_button("Log in")
+         if submitted:
+             if role == "admin" and u == ADMIN_USER and p == ADMIN_PASS:
+                 st.session_state["authed"] = True
+                 st.session_state["role"] = "admin"
+                 st.success("Logged in as admin.")
+                 time.sleep(0.3)
+                 _rerun()
+             elif role == "client":
                 client = get_client_by_username(u)
                 st.write(f"Debug: Client fetched: {client}")
-                if client and client.get("portal_enabled", True) and p.lower() == client.get("portal_pass", "").lower():
-                    st.session_state["authed"] = True
-                    st.session_state["role"] = "client"
-                    st.session_state["client_id"] = client["id"]  # <-- bind to a specific client
-                    st.success(f"Logged in as client: {client['company_name']}")
-                    _rerun()
+                if client and client.get("portal_enabled", True) and verify_password(p, client.get("portal_pass", "") or ""):
+                     st.session_state["authed"] = True
+                     st.session_state["role"] = "client"
+                     st.session_state["client_id"] = client["id"]  # <-- bind to a specific client
+                     st.success(f"Logged in as client: {client['company_name']}")
+                     _rerun()
                 else:
-                    st.error("Invalid client credentials or portal disabled")
-            else:
-                st.error("Invalid credentials")
+                     st.error("Invalid client credentials or portal disabled")
+             else:
+                 st.error("Invalid credentials")
 
 def ensure_auth():
     if "authed" not in st.session_state:
@@ -496,5 +467,64 @@ if __name__ == "__main__":
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
-def check_password(password: str, hashed: str) -> bool:
-    return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+def check_password_bcrypt(password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+def verify_password(password: str, stored: str) -> bool:
+    """
+    Verify stored credential. First try bcrypt, fallback to plaintext compare for
+    backwards compatibility (existing plain-text rows). Avoid introducing timing attack vectors in high-risk contexts.
+    """
+    if not stored:
+        return False
+    # try bcrypt
+    if check_password_bcrypt(password, stored):
+        return True
+    # fallback plain text (legacy)
+    try:
+        return password == stored
+    except Exception:
+        return False
+
+def call_gemini_api(prompt: str) -> str:
+    """
+    Calls the Gemini AI API to generate content based on the provided prompt.
+
+    Args:
+        prompt (str): The text prompt to send to the Gemini API.
+
+    Returns:
+        str: The generated content from the Gemini API.
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is not set in the environment variables.")
+
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+    headers = {
+        "Content-Type": "application/json",
+        "X-goog-api-key": api_key,
+    }
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ]
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+
+    if response.status_code == 200:
+        data = response.json()
+        # Extract the generated content (adjust based on the API's response structure)
+        return data.get("contents", [{}])[0].get("parts", [{}])[0].get("text", "")
+    else:
+        raise RuntimeError(f"Gemini API call failed: {response.status_code} - {response.text}")

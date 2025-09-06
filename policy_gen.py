@@ -1,37 +1,43 @@
 import os, json, hashlib
 from datetime import datetime, timezone
-from supabase import create_client, Client
-from openai import OpenAI
 from dotenv import load_dotenv
 import sys
 from llm_adapter import LLMAdapter
+from db_utils import sb, get_client_by_name as db_get_client_by_name, get_client_by_id as db_get_client_by_id
 
-# Load environment variables
-load_dotenv(dotenv_path=".env")  # Explicitly specify the path if needed
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    print("❌ Missing SUPABASE_URL or SUPABASE_KEY env vars.")
-    print(f"SUPABASE_URL: {SUPABASE_URL}")
-    print(f"SUPABASE_KEY: {SUPABASE_KEY}")
-    print(f"OPENAI_API_KEY: {OPENAI_API_KEY}")
-    sys.exit(1)
+# load env
+load_dotenv(dotenv_path=".env")
 
 # --- ENV ---
-AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")    # upgrade to gpt-4o when ready
-
-sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-oai = OpenAI(api_key=OPENAI_API_KEY)
+AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
 llm = LLMAdapter()
 
+# categories used when assembling FINTRAC bundle
+RELEVANT_CATEGORIES_FOR_MSB = {
+    "MSB",
+    "MSB Obligations",
+    "Registration",
+    "Guidance",
+    "Interpretation",
+    "Act",
+}
+
 def get_client(company_name: str):
+    # prefer name lookup via db_utils; keep wrapper for backwards compatibility
+    return db_get_client_by_name(company_name)
+
+def get_client_by_name(company_name: str):
+    """
+    Fetches a client from the Supabase database by its company name.
+
+    Args:
+        company_name (str): The name of the company.
+
+    Returns:
+        dict: The client record, or None if not found.
+    """
     res = sb.table("clients").select("*").eq("company_name", company_name).limit(1).execute()
-    if not res.data:
-        raise RuntimeError(f"Client not found: {company_name}")
-    return res.data[0]
+    return res.data[0] if res.data else None
 
 def get_fintrac_text():
     res = sb.table("regulations").select("*")\
@@ -114,9 +120,12 @@ def save_policy(client_id: str, language: str, reg_hash: str, sections_json: dic
     }, on_conflict="client_id,regulation_source,regulation_title,regulation_hash").execute()
 
 def generate_policy_for_client(company_name: str, preferred_language: str | None = None) -> str:
-    client = get_client_by_name(company_name)
-    language = preferred_language or client.get("language","en")
-    prov = client.get("province","N/A")
+    client = get_client_by_id(company_name)  # Replace get_client_by_name with get_client_by_id
+    if not client:
+        raise RuntimeError(f"Client not found: {company_name}")
+
+    language = preferred_language or client.get("language", "en")
+    prov = client.get("province", "N/A")
 
     regs_text, regs_title = fetch_relevant_text_for_msb(lang=language)
     reg_hash = hashlib.sha256(regs_text.encode("utf-8")).hexdigest()
@@ -132,17 +141,25 @@ Relevant FINTRAC excerpts (MSB):
 Write a prescriptive AML policy for this client with concise, actionable language and cite where appropriate.
 """
 
-    out = llm.chat_json(SYSTEM_PROMPT, user_prompt)
+    # generate via centralized adapter (Gemini by default)
+    resp = llm.generate_text(user_prompt, max_output_tokens=1200, temperature=0.0)
+    policy_text = llm.text_for(resp)
+    # if we expect structured JSON, try to parse; fallback to text markdown
+    try:
+        sections_json = json.loads(policy_text)
+        policy_md = to_markdown(sections_json)
+    except Exception:
+        sections_json = {}
+        policy_md = policy_text
 
-    policy_md = to_markdown(out)
     sb.table("policies").upsert({
         "client_id": client["id"],
         "language": language,
         "regulation_source": "FINTRAC",
         "regulation_title": regs_title,
         "regulation_hash": reg_hash,
-        "ai_model": os.getenv("LLM_MODEL","gpt-4o-mini"),
-        "sections_json": out,
+        "ai_model": os.getenv("LLM_PROVIDER", "gemini"),
+        "sections_json": sections_json,
         "policy_markdown": policy_md
     }, on_conflict="client_id,regulation_source,regulation_title,regulation_hash").execute()
 
@@ -162,9 +179,19 @@ def fetch_relevant_text_for_msb(lang="en") -> tuple[str, str]:
     combined = "\n\n".join(chunks)
     return combined[:60000], "MSB Bundle"
 
+def generate_policy_with_gemini(prompt: str) -> str:
+    resp = llm.generate_text(prompt, max_output_tokens=1200, temperature=0.0)
+    return llm.text_for(resp)
+
 if __name__ == "__main__":
     # Example:
     #   SUPABASE_URL=... SUPABASE_KEY=... OPENAI_API_KEY=... python policy_generator.py
     print("Generating policy for: MapleX Payments Inc.")
     doc = generate_policy_for_client("MapleX Payments Inc.")
     print(doc[:1200], "\n...\n[truncated]")
+
+    prompt = "Explain how AI works in a few words."
+    response = call_gemini_api(prompt)
+    print("Gemini Response:", response)
+
+print(f"LLM Provider: {self.provider}")
