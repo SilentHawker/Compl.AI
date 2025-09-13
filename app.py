@@ -5,9 +5,36 @@ import streamlit as st
 from dotenv import load_dotenv
 import bcrypt
 import requests
+from io import BytesIO
+from html2docx import html2docx
+import markdown as mdlib
 
-# ---- Streamlit compatibility shims (new & old APIs) ----
-import streamlit as st
+from db_utils import (
+    sb,
+    list_clients as db_list_clients,
+    list_policies as db_list_policies,
+    get_client_by_token as db_get_client_by_token,
+    get_client_by_username as db_get_client_by_username,
+    get_client_by_id as db_get_client_by_id,
+    get_client_by_name as db_get_client_by_name,
+    list_sources as db_list_sources,
+    list_registrations_for_versions as db_list_regs_for_versions,
+    list_versions as db_list_versions,
+    get_version_content_by_no as db_get_version_content_by_no,
+    get_policies_by_client as db_get_policies_by_client,
+)
+
+def list_clients(): return db_list_clients()
+def list_policies(client_id): return db_list_policies(client_id)
+def get_client_by_token(tok): return db_get_client_by_token(tok)
+def get_client_by_username(username): return db_get_client_by_username(username)
+def get_client_by_id(client_id): return db_get_client_by_id(client_id)
+def get_client_by_name(company_name): return db_get_client_by_name(company_name)
+def list_sources(): return db_list_sources()
+def list_registrations_for_versions(): return db_list_regs_for_versions()
+def list_versions(regulation_id): return db_list_versions(regulation_id)
+def get_version_content_by_no(regulation_id, version_no): return db_get_version_content_by_no(regulation_id, version_no)
+def get_policies_by_client(client_id): return db_get_policies_by_client(client_id)
 
 def _rerun():
     if hasattr(st, "rerun"):
@@ -45,17 +72,6 @@ CLIENT_PASS = os.getenv("CLIENT_PASS", "test123")
 # Where client portal links should point (same app is fine)
 PORTAL_BASE = os.getenv("CLIENT_PORTAL_BASE_URL", "http://localhost:8501")
 
-# Use centralized DB helpers
-from db_utils import (
-    sb,
-    list_clients as db_list_clients,
-    list_policies as db_list_policies,
-    get_client_by_token as db_get_client_by_token,
-    get_client_by_username as db_get_client_by_username,
-    get_client_by_id as db_get_client_by_id,
-    get_client_by_name as db_get_client_by_name,
-)
-
 st.set_page_config(page_title="ComplianceAI", layout="wide")
 
 # Try to import your real generator; otherwise stub so UI still runs
@@ -75,27 +91,26 @@ def ts(s):
     except Exception:
         return s
 
-# Delegates to db_utils (avoid reimplementations)
-def list_clients():
-    return db_list_clients()
+# ---- Password check helpers ----
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
-def list_policies(client_id):
-    return db_list_policies(client_id)
+def check_password_bcrypt(password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
 
-def get_client_by_token(tok):
-    return db_get_client_by_token(tok)
-
-def get_client_by_username(username):
-    # keep debug info in UI only
-    client = db_get_client_by_username(username)
-    st.write(f"Debug: Query result for username '{username}': {client}")
-    return client
-
-def get_client_by_id(client_id: str):
-    return db_get_client_by_id(client_id)
-
-def get_client_by_name(company_name: str):
-    return db_get_client_by_name(company_name)
+def verify_password(password: str, stored: str) -> bool:
+    """
+    Returns True if password matches stored credential.
+    - Supports bcrypt (stored starts with $2a/$2b/$2y) and plaintext (MVP).
+    """
+    if not stored:
+        return False
+    if stored.startswith("$2a$") or stored.startswith("$2b$") or stored.startswith("$2y$"):
+        return check_password_bcrypt(password, stored)
+    return password == stored
 
 def add_client(name, prov, lang):
     sb.table("clients").insert({"company_name": name, "province": prov, "language": lang}).execute()
@@ -113,6 +128,21 @@ def set_client_portal_creds(client_id: str, user: str, pwd: str, enabled: bool =
         "portal_pass": hashed,
         "portal_enabled": enabled
     }).eq("id", client_id).execute()
+
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+def md_to_docx_bytes(md_text: str, title: str = "AML Policy") -> bytes:
+    """
+    Convert Markdown -> HTML -> .docx bytes using html2docx.
+    No Document() object or 'document=' kwarg is needed.
+    """
+    html = mdlib.markdown(md_text, extensions=["tables", "fenced_code", "toc"])
+    # html2docx returns bytes directly
+    docx_bytes = html2docx(html)
+    # basic sanity
+    if not isinstance(docx_bytes, (bytes, bytearray)):
+        raise RuntimeError("html2docx did not return bytes")
+    return docx_bytes
 
 # ------------------ AUTH ------------------
 def show_login():
@@ -204,15 +234,42 @@ def admin_ui():
                             st.code(f"{PORTAL_BASE}/?token={new_tok}", language="text")
 
                     with col2:
-                        lang_sel = st.selectbox(f"Language for {c['company_name']}", ["en", "fr"], index=0, key="lang_" + c["id"])
-                        if st.button(f"Generate policy", key="gen_" + c["id"]):
+                        clicked = st.button(f"Generate policy", key="gen_" + c["id"])
+                        if clicked:
                             if HAVE_GENERATOR:
                                 with st.spinner("Generating…"):
                                     md = generate_policy_for_client(c["company_name"], preferred_language=lang_sel)
-                                st.success("Policy generated.")
-                                st.download_button("Download Markdown", md, file_name=f"{c['company_name']}_AML_Policy.md", mime="text/markdown")
+                                st.session_state[f"admin_last_md_{c['id']}"] = md
+                                st.session_state[f"admin_last_fn_{c['id']}"] = f"{c['company_name']}_AML_Policy.md"
+                                st.success("Policy generated. Scroll to download below.")
                             else:
                                 st.warning("Connect policy_generator.py to enable real generation.")
+
+                        # Show last result for this card (if any)
+                        if st.session_state.get(f"admin_last_md_{c['id']}"):
+                            amd = st.session_state[f"admin_last_md_{c['id']}"]
+                            afn = st.session_state.get(f"admin_last_fn_{c['id']}", f"{c['company_name']}_AML_Policy.md")
+                            st.download_button("⬇️ Download latest", amd, file_name=afn, mime="text/markdown", key=f"dl_{c['id']}")
+                            with st.expander("Preview latest"):
+                                st.markdown(amd)
+
+                        if st.session_state.get(f"admin_last_md_{c['id']}"):
+                            amd = st.session_state[f"admin_last_md_{c['id']}"]
+                            afn = st.session_state.get(f"admin_last_fn_{c['id']}", f"{c['company_name']}_AML_Policy")
+
+                            st.download_button("⬇️ Download latest (Markdown)", amd,
+                               file_name=f"{afn}.md", mime="text/markdown", key=f"dl_md_{c['id']}")
+
+                        # NEW: Word
+                        try:
+                            adocx = md_to_docx_bytes(amd)
+                            st.download_button("⬇️ Download latest (Word .docx)", adocx,
+                           file_name=f"{afn}.docx", mime=DOCX_MIME, key=f"dl_docx_{c['id']}")
+                        except Exception as e:
+                            st.caption(f"Could not build .docx: {e}")
+
+                        with st.expander("Preview latest"):
+                            st.markdown(amd)
 
                     with col3:
                         pols = list_policies(c["id"])
@@ -428,18 +485,43 @@ def client_ui():
     st.markdown("---")
     st.subheader("Generate a new policy")
     lang_sel = st.selectbox("Language", ["en", "fr"], index=0)
-    if st.button("Generate now"):
+
+    clicked = st.button("Generate now")
+    if clicked:
         if HAVE_GENERATOR:
             with st.spinner("Generating…"):
                 md = generate_policy_for_client(client["company_name"], preferred_language=lang_sel)
-            st.success("Policy generated.")
-            st.download_button("Download Markdown", md,
-                               file_name=f"{client['company_name']}_AML_Policy.md",
-                               mime="text/markdown")
-            time.sleep(0.4)
-            _rerun()
+            st.session_state["last_policy_md"] = md
+            st.session_state["last_policy_filename"] = f"{client['company_name']}_AML_Policy.md"
+            st.success("Policy generated. See download/preview below.")
         else:
             st.warning("The generator is not connected. Ask your admin to enable it.")
+
+# Show latest (if present)
+    if st.session_state.get("last_policy_md"):
+        md = st.session_state["last_policy_md"]
+        fname = st.session_state.get("last_policy_filename", "AML_Policy.md")
+        st.download_button("⬇️ Download latest generated policy", md, file_name=fname, mime="text/markdown")
+        with st.expander("Preview latest generated policy"):
+            st.markdown(md)
+
+    if st.session_state.get("last_policy_md"):
+        md = st.session_state["last_policy_md"]
+        fname_base = st.session_state.get("last_policy_filename", "AML_Policy")
+
+        # Existing Markdown download
+        st.download_button("⬇️ Download latest (Markdown)", md,file_name=f"{fname_base}.md", mime="text/markdown")
+
+    # NEW: Word download
+        try:
+            docx_bytes = md_to_docx_bytes(md)
+            st.download_button("⬇️ Download latest (Word .docx)", docx_bytes, file_name=f"{fname_base}.docx", mime=DOCX_MIME)
+        except Exception as e:
+            st.caption(f"Could not build .docx: {e}")
+
+        with st.expander("Preview latest generated policy"):
+            st.markdown(md)
+
 
 # ------------------ ROUTER ------------------
 def show_login_and_route():
@@ -460,34 +542,6 @@ def show_login_and_route():
     else:
         st.error("Unknown role. Please log in again.")
         st.session_state.clear()
-
-if __name__ == "__main__":
-    show_login_and_route()
-
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-
-def check_password_bcrypt(password: str, hashed: str) -> bool:
-    try:
-        return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
-    except Exception:
-        return False
-
-def verify_password(password: str, stored: str) -> bool:
-    """
-    Verify stored credential. First try bcrypt, fallback to plaintext compare for
-    backwards compatibility (existing plain-text rows). Avoid introducing timing attack vectors in high-risk contexts.
-    """
-    if not stored:
-        return False
-    # try bcrypt
-    if check_password_bcrypt(password, stored):
-        return True
-    # fallback plain text (legacy)
-    try:
-        return password == stored
-    except Exception:
-        return False
 
 def call_gemini_api(prompt: str) -> str:
     """
@@ -528,3 +582,7 @@ def call_gemini_api(prompt: str) -> str:
         return data.get("contents", [{}])[0].get("parts", [{}])[0].get("text", "")
     else:
         raise RuntimeError(f"Gemini API call failed: {response.status_code} - {response.text}")
+    
+    # --- ENTRYPOINT (must be last) ---
+show_login_and_route()
+
