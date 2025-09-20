@@ -9,8 +9,9 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY environment variables.")
+    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY in environment")
 
+# create supabase client once
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ---------- Clients ----------
@@ -43,12 +44,23 @@ def list_clients() -> List[Dict[str, Any]]:
               .execute().data or [])
 
 # ---------- Policies ----------
-def list_policies(client_id: str) -> List[Dict[str, Any]]:
-    return (sb.table("policies")
-              .select("id,regulation_title,generated_at,language,ai_model")
-              .eq("client_id", client_id)
-              .order("generated_at", desc=True)
-              .execute().data or [])
+def list_policies(client_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Return policies for a given client_id. If client_id is None, return all policies.
+    Attempt to order by created_at if available; fall back to an unordered query if the column does not exist.
+    """
+    try:
+        if client_id:
+            res = sb.table("policies").select("*").eq("client_id", client_id).order("created_at", desc=True).execute()
+        else:
+            res = sb.table("policies").select("*").order("created_at", desc=True).execute()
+    except Exception:
+        # fallback if created_at column doesn't exist (or other Postgrest errors)
+        if client_id:
+            res = sb.table("policies").select("*").eq("client_id", client_id).execute()
+        else:
+            res = sb.table("policies").select("*").execute()
+    return res.data or []
 
 # alias used by client portal code
 def get_policies_by_client(client_id: str) -> List[Dict[str, Any]]:
@@ -69,12 +81,24 @@ def list_registrations_for_versions() -> List[Dict[str, Any]]:
               .order("title")
               .execute().data or [])
 
-def list_versions(regulation_id: str) -> List[Dict[str, Any]]:
-    return (sb.table("regulation_versions")
-              .select("id,version_no,content_hash,scraped_at,change_summary")
-              .eq("regulation_id", regulation_id)
-              .order("version_no", desc=True)
-              .execute().data or [])
+def list_versions(regulation_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Return versions for a given regulation_id. If regulation_id is None, return all versions.
+    Safe fallback if ordering column does not exist.
+    """
+    try:
+        if regulation_id:
+            res = sb.table("regulation_versions").select("*").eq("regulation_id", regulation_id).order("version_no", desc=True).execute()
+        else:
+            # return all versions ordered by regulation_id then version_no where possible
+            res = sb.table("regulation_versions").select("*").order("regulation_id", desc=False).order("version_no", desc=True).execute()
+    except Exception:
+        # fallback to simpler queries if schema differs
+        if regulation_id:
+            res = sb.table("regulation_versions").select("*").eq("regulation_id", regulation_id).execute()
+        else:
+            res = sb.table("regulation_versions").select("*").execute()
+    return res.data or []
 
 def get_version_content_by_no(regulation_id: str, version_no: int) -> Optional[Dict[str, Any]]:
     rows = (sb.table("regulation_versions")

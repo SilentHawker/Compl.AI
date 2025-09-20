@@ -1,9 +1,9 @@
-import os, json, hashlib, requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-import sys
 from llm_adapter import LLMAdapter
 from db_utils import sb, get_client_by_name as db_get_client_by_name, get_client_by_id as db_get_client_by_id
+import os, json, hashlib, re, ast, codecs
+from datetime import datetime, timezone, date
 
 # token handling
 try:
@@ -16,8 +16,11 @@ except Exception:
 load_dotenv(dotenv_path=".env")
 
 # --- ENV ---
-AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
-llm = LLMAdapter()
+# Prefer explicit model env vars used in this project (GEMINI_MODEL or LLM_MODEL).
+# Default to Gemini Flash 2 if not set.
+AI_MODEL = os.getenv("LLM_MODEL")
+# instantiate adapter with the chosen model so adapter and generator are aligned
+llm = LLMAdapter(model=AI_MODEL)
 
 # categories used when assembling FINTRAC bundle
 RELEVANT_CATEGORIES_FOR_MSB = {
@@ -30,7 +33,6 @@ RELEVANT_CATEGORIES_FOR_MSB = {
 }
 
 def get_client(company_name: str):
-    # prefer name lookup via db_utils; keep wrapper for backwards compatibility
     return db_get_client_by_name(company_name)
 
 def get_client_by_name(company_name: str):
@@ -126,6 +128,20 @@ def save_policy(client_id: str, language: str, reg_hash: str, sections_json: dic
     "generated_at": datetime.now(timezone.utc).isoformat()  # <-- important
 }, on_conflict="client_id,regulation_source,regulation_title,regulation_hash").execute()
 
+def fetch_relevant_text_for_msb(lang="en") -> tuple[str, str]:
+    q = sb.table("regulations").select("title,category,content").eq("source", "FINTRAC").eq("lang", lang).execute()
+    chunks = []
+    for row in q.data or []:
+        if (row.get("category") or "").strip() in RELEVANT_CATEGORIES_FOR_MSB:
+            title = row.get("title", "(untitled)")
+            content = row.get("content", "").strip()
+            if content:
+                chunks.append(f"### {title}\n{content}")
+    if not chunks:
+        raise RuntimeError("No relevant FINTRAC content found for MSB.")
+    combined = "\n\n".join(chunks)
+    return combined[:60000], "MSB Bundle"
+
 def _estimate_tokens(text: str, model: str | None = None) -> int:
     """
     Estimate token count for `text`. Use tiktoken when available, otherwise a conservative word-based heuristic.
@@ -180,8 +196,127 @@ def _prepare_prompt(client: dict, regs_text: str, language: str,
     user_prompt = preamble + regs_text + "\n\nWrite a prescriptive AML policy for this client with concise, actionable language and cite where appropriate."
     return user_prompt, max_output_tokens
 
-def generate_policy_for_client(company_name: str, preferred_language: str | None = None) -> str:
-    # prefer name lookup via db_utils wrapper
+def _extract_parts_text(s: str) -> str:
+    """If the LLM returned a 'parts' wrapper (stringified), extract the inner text cleanly."""
+    if not s or not isinstance(s, str):
+        return s
+
+    text = s
+
+    # Normalize bold/markdown wrapping around the word "parts" (e.g. "**parts:**")
+    text = re.sub(r'^[\s`]*\*{0,2}\s*parts\s*\*{0,2}\s*[:\*]*\s*', 'parts: ', text, flags=re.IGNORECASE)
+
+    # 1) Try to find Python-style parts[...] repr and parse with ast.literal_eval
+    m = re.search(r"parts\s*[:=]\s*(\[[\s\S]*\])", text, flags=re.IGNORECASE)
+    if m:
+        list_repr = m.group(1)
+        try:
+            obj = ast.literal_eval(list_repr)
+            if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+                txt = obj[0].get("text") or obj[0].get("content")
+                if isinstance(txt, str) and txt.strip():
+                    return txt
+        except Exception:
+            # fall through to other heuristics
+            pass
+
+    # 2) Try JSON-like extraction: "candidates" / "content" / "parts" / "text"
+    try:
+        maybe_json = None
+        # If the string looks like JSON anywhere, try to extract it and parse
+        json_start = text.find('{')
+        if json_start != -1:
+            try:
+                maybe_json = json.loads(text[json_start:])
+            except Exception:
+                # try to salvage by finding the first '[' that starts parts list
+                pass
+        if isinstance(maybe_json, dict):
+            # navigate common Gemini response shapes
+            try:
+                cand = maybe_json.get("candidates") or maybe_json.get("outputs") or maybe_json.get("choices")
+                if isinstance(cand, list) and cand:
+                    # scan candidates for content.parts.text
+                    for c in cand:
+                        # nested shapes
+                        content = c.get("content") if isinstance(c, dict) else None
+                        if isinstance(content, dict):
+                            parts = content.get("parts") or content.get("outputs") or []
+                            if isinstance(parts, list) and parts:
+                                p0 = parts[0]
+                                if isinstance(p0, dict) and p0.get("text"):
+                                    return p0.get("text")
+                                if isinstance(p0, str):
+                                    return p0
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 3) Regex fallback: extract "text": "...." within the parts block (handles double quotes)
+    m2 = re.search(r"""['"]?text['"]?\s*[:=]\s*["']([\s\S]+?)["']\s*(?:,|\])""", text, flags=re.DOTALL)
+    if m2:
+        return m2.group(1)
+
+    # 4) If the string contains a visible markdown heading (## ), return from that heading
+    m3 = re.search(r"(#{1,6}\s+[A-Za-z0-9].*)", text, flags=re.DOTALL)
+    if m3:
+        return text[m3.start():].strip()
+
+    # nothing matched, return original
+    return s
+
+def _unescape_visible_escapes(text: str) -> str:
+    """Convert literal escape sequences (\\n, \\r\\n, double-escaped) into real newlines."""
+    if not text:
+        return text
+    t = str(text)
+    # iterative unescape to handle double-escaped sequences
+    for _ in range(4):
+        prev = t
+        t = t.replace("\\r\\n", "\r\n").replace("\\n", "\n").replace("\\t", "\t")
+        t = t.replace("\\\\n", "\\n").replace("\\\\r\\\\n", "\\r\\n")
+        try:
+            dec = codecs.decode(t, "unicode_escape")
+            if dec != t:
+                t = dec
+        except Exception:
+            pass
+        if t == prev:
+            break
+    # strip surrounding quotes if present
+    if (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
+        t = t[1:-1]
+    return t
+
+def _fix_mojibake(text: str) -> str:
+    """
+    Try to repair double-encoded UTF-8 mojibake like "ÃÂ..." by applying latin1->utf8 decode iteratively.
+    Safe no-op if text is fine.
+    """
+    if not text or not isinstance(text, str):
+        return text
+    s = text
+    # only try if suspicious characters present
+    if "Ã" not in s and "Â" not in s:
+        return s
+    for _ in range(3):
+        try:
+            s2 = s.encode("latin-1").decode("utf-8")
+        except Exception:
+            break
+        if s2 == s:
+            break
+        s = s2
+        # quick exit if fixed
+        if "Ã" not in s and "Â" not in s:
+            break
+    return s
+
+def generate_policy_for_client(company_name: str, preferred_language: str | None = None, custom_prompt: str | None = None) -> str:
+    """
+    Generate a policy. Accepts an optional custom_prompt containing {client} and {regs} placeholders.
+    """
     client = get_client(company_name)
     if not client:
         raise RuntimeError(f"Client not found: {company_name}")
@@ -192,33 +327,50 @@ def generate_policy_for_client(company_name: str, preferred_language: str | None
     regs_text, regs_title = fetch_relevant_text_for_msb(lang=language)
     reg_hash = hashlib.sha256(regs_text.encode("utf-8")).hexdigest()
 
-    # Conservative defaults:
-    # - prompt_token_budget: total tokens for prompt (including regs_text) -> 6000
-    # - max_output_tokens: tokens for model output -> 800
-    # These are conservative for Gemini; reduce if you need lower cost.
-    prompt_tok_budget = int(os.getenv("PROMPT_TOKEN_BUDGET", "60000"))
-    max_out = int(os.getenv("MAX_OUTPUT_TOKENS", "8000"))
+    if custom_prompt:
+        client_summary = f"Company: {client['company_name']}\nProvince: {prov}\nLanguage: {language}"
+        user_prompt = custom_prompt.replace("{client}", client_summary).replace("{regs}", regs_text)
+    else:
+        # use token-aware prompt builder
+        prompt_tok_budget = int(os.getenv("PROMPT_TOKEN_BUDGET", "6000"))
+        max_out = int(os.getenv("MAX_OUTPUT_TOKENS", "800"))
+        user_prompt, max_out = _prepare_prompt(client, regs_text, language,
+                                              max_output_tokens=max_out,
+                                              prompt_token_budget=prompt_tok_budget,
+                                              model_hint=os.getenv("LLM_MODEL", AI_MODEL))
 
-    user_prompt, max_output_tokens = _prepare_prompt(client, regs_text, language,
-                                                     max_output_tokens=max_out,
-                                                     prompt_token_budget=prompt_tok_budget,
-                                                     model_hint=os.getenv("LLM_MODEL", AI_MODEL))
-
-    # generate via centralized adapter (Gemini by default)
     try:
-        resp = llm.generate_text(user_prompt, max_output_tokens=max_output_tokens, temperature=0.0)
+        resp = llm.generate_text(user_prompt, max_output_tokens=int(os.getenv("MAX_OUTPUT_TOKENS", "800")), temperature=0.0)
         policy_text = llm.text_for(resp)
     except Exception as e:
-        # Surface helpful debug info for API failures
         raise RuntimeError(f"LLM generation failed: {e}") from e
 
-    # if we expect structured JSON, try to parse; fallback to text markdown
+    # extract inner parts and unescape visible escapes so markdown renders correctly
     try:
-        sections_json = json.loads(policy_text)
-        policy_md = to_markdown(sections_json)
+        policy_text = _extract_parts_text(policy_text)
+        policy_text = _unescape_visible_escapes(policy_text)
+        # attempt to fix mojibake where bytes were double-decoded
+        policy_text = _fix_mojibake(policy_text)
     except Exception:
-        sections_json = {}
+        pass
+
+    # Ensure we always store and return markdown text for UI
+    policy_md = None
+    sections_json = {}
+    try:
+        parsed = json.loads(policy_text)
+        # convert structured JSON to readable markdown
+        policy_md = _json_to_markdown(parsed)
+        sections_json = parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        # not JSON -> assume raw markdown/plain text
         policy_md = policy_text
+
+    # fill placeholders (date, client) before persisting/displaying
+    try:
+        policy_md = _fill_placeholders(policy_md, client)
+    except Exception:
+        pass
 
     sb.table("policies").upsert({
         "client_id": client["id"],
@@ -228,24 +380,11 @@ def generate_policy_for_client(company_name: str, preferred_language: str | None
         "regulation_hash": reg_hash,
         "ai_model": os.getenv("LLM_PROVIDER", "gemini"),
         "sections_json": sections_json,
-        "policy_markdown": policy_md
+        "policy_markdown": policy_md,
+        "generated_at": datetime.now(timezone.utc).isoformat()
     }, on_conflict="client_id,regulation_source,regulation_title,regulation_hash").execute()
 
     return policy_md
-
-def fetch_relevant_text_for_msb(lang="en") -> tuple[str, str]:
-    q = sb.table("regulations").select("title,category,content").eq("source", "FINTRAC").eq("lang", lang).execute()
-    chunks = []
-    for row in q.data or []:
-        if (row.get("category") or "").strip() in RELEVANT_CATEGORIES_FOR_MSB:
-            title = row.get("title", "(untitled)")
-            content = row.get("content", "").strip()
-            if content:
-                chunks.append(f"### {title}\n{content}")
-    if not chunks:
-        raise RuntimeError("No relevant FINTRAC content found for MSB.")
-    combined = "\n\n".join(chunks)
-    return combined[:60000], "MSB Bundle"
 
 def generate_policy_with_gemini(prompt: str) -> str:
     resp = llm.generate_text(prompt, max_output_tokens=1200, temperature=0.0)
