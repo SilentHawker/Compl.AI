@@ -313,9 +313,30 @@ def _fix_mojibake(text: str) -> str:
             break
     return s
 
+# Master/system prompt (always prepended to whatever user/custom prompt you send to the model)
+MASTER_POLICY_PROMPT = """Role / Persona
+ You are a senior Canadian AML/ATF and regulatory compliance specialist with deep knowledge of the PCMLTFA, its Regulations, and FINTRAC guidance for Money Services Businesses (MSBs). You know the reporting and record-keeping requirements for LCTR, LVCTR, EFTR, 24-hour rule, travel rule, virtual currency, ministerial directives, and the KYC/ID methods (photo ID, credit file, dual-process, reliance, agent/mandatary, SDD). You also understand multi-service MSBs (remittance, FX, VC, negotiable instruments, cheque cashing, crowdfunding, transport services).
+
+Input Documents
+“Client policy pre-production questionnaire.docx” — use the client’s actual answers to determine which sections and subsections are in scope. Do not assume “Yes” unless the user says so.
+
+“Policy Creation Decision Tree_MSB.docx” — this is the master logic that says: if the questionnaire answer is “Yes”, then the corresponding bold section/subsection must appear in the policy.
+
+(Optional) Client’s existing AML/Compliance Policy — if provided, compare to the decision tree + questionnaire.
+
+Goal
+ Produce a complete policy coverage map and gap analysis for a Canadian MSB, and then draft the fully expanded AML/ATF Policy that reflects all “Yes” branches in the decision tree, aligned to FINTRAC guidance.
+
+Tasks for the Model
+Ingest the questionnaire and apply the decision tree and mapping instructions. Use the provided FINTRAC sources and output the Gap Analysis Table and the Complete AML Policy as specified. Use placeholders [placeholder] where client-specific values are required. Cite FINTRAC after material obligations.
+
+Note: Replace {client} with the client identification and {regs} with the title or label for the regulatory excerpts you were given. Do not omit sections that the client answered "Yes" to in the questionnaire. When ambiguous, choose the more conservative interpretation and note it.
+"""
+
 def generate_policy_for_client(company_name: str, preferred_language: str | None = None, custom_prompt: str | None = None) -> str:
     """
     Generate a policy. Accepts an optional custom_prompt containing {client} and {regs} placeholders.
+    The MASTER_POLICY_PROMPT is always prepended (with {client}/{regs} substituted).
     """
     client = get_client(company_name)
     if not client:
@@ -327,17 +348,30 @@ def generate_policy_for_client(company_name: str, preferred_language: str | None
     regs_text, regs_title = fetch_relevant_text_for_msb(lang=language)
     reg_hash = hashlib.sha256(regs_text.encode("utf-8")).hexdigest()
 
+    # prepare client/reg placeholders for MASTER_PROMPT and any custom prompt
+    client_summary = f"Company: {client['company_name']}\nProvince: {prov}\nLanguage: {language}"
+    regs_label = regs_title or "Relevant regulatory excerpts"
+
+    # fill master prompt placeholders
+    master_filled = MASTER_POLICY_PROMPT.replace("{client}", client_summary).replace("{regs}", regs_label)
+
     if custom_prompt:
-        client_summary = f"Company: {client['company_name']}\nProvince: {prov}\nLanguage: {language}"
-        user_prompt = custom_prompt.replace("{client}", client_summary).replace("{regs}", regs_text)
+        # allow user-supplied prompt but still prepend the master/system prompt
+        # substitute placeholders in custom_prompt as well
+        try:
+            custom_filled = custom_prompt.replace("{client}", client_summary).replace("{regs}", regs_text)
+        except Exception:
+            custom_filled = custom_prompt
+        user_prompt = master_filled + "\n\n" + custom_filled
     else:
-        # use token-aware prompt builder
+        # build the regular token-aware prompt and then prepend the master/system prompt
         prompt_tok_budget = int(os.getenv("PROMPT_TOKEN_BUDGET", "6000"))
         max_out = int(os.getenv("MAX_OUTPUT_TOKENS", "800"))
-        user_prompt, max_out = _prepare_prompt(client, regs_text, language,
+        body_prompt, max_out = _prepare_prompt(client, regs_text, language,
                                               max_output_tokens=max_out,
                                               prompt_token_budget=prompt_tok_budget,
                                               model_hint=os.getenv("LLM_MODEL", AI_MODEL))
+        user_prompt = master_filled + "\n\n" + body_prompt
 
     try:
         resp = llm.generate_text(user_prompt, max_output_tokens=int(os.getenv("MAX_OUTPUT_TOKENS", "800")), temperature=0.0)
