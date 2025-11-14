@@ -78,6 +78,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------- AUTH DEPENDENCY (ensure defined before endpoints) ----------
+def require_api_key(x_api_key: str = Header(...)):
+    """
+    Validate API key header against environment variable.
+    Raises 401 if invalid, 500 if server not configured.
+    """
+    expected = os.getenv("API_KEY")
+    if not expected:
+        raise HTTPException(status_code=500, detail="Server API key not configured")
+    if x_api_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return x_api_key
+
 # -------- helpers ----------
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
@@ -241,16 +254,6 @@ async def api_add_client(payload: dict):
         raise HTTPException(status_code=400, detail="company_name required")
     add_res = sb.table("clients").insert({"company_name": name, "province": prov, "language": lang}).execute()
     return {"ok": True, "result": add_res.data if hasattr(add_res, "data") else None}
-
-# Update require_api_key to read from env at call time
-def require_api_key(x_api_key: str = Header(...)):
-    expected = os.getenv("API_KEY")
-    if not expected:
-        # if no API_KEY in env, be explicit and reject
-        raise HTTPException(status_code=500, detail="Server API key not configured")
-    if x_api_key != expected:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return x_api_key
 
 @app.post("/auth/login")
 async def api_login(username: str, password: str, role: str = "client"):

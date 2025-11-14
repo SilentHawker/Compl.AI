@@ -108,3 +108,98 @@ def get_version_content_by_no(regulation_id: str, version_no: int) -> Optional[D
               .limit(1)
               .execute().data or [])
     return rows[0] if rows else None
+
+def get_admin_by_email(email: str) -> Optional[dict]:
+    if not email:
+        return None
+    res = sb.table("admin_users").select("*").eq("email", email).limit(1).execute()
+    return res.data[0] if res.data else None
+
+def create_admin_user(email: str, password_hash: str, full_name: str, role: str = "admin") -> dict:
+    data = {
+        "email": email,
+        "password_hash": password_hash,
+        "full_name": full_name,
+        "role": role,
+        "is_active": True
+    }
+    res = sb.table("admin_users").insert(data).execute()
+    return res.data[0] if res.data else None
+
+def update_admin_last_login(admin_id: str):
+    sb.table("admin_users").update({"last_login": "now()"}).eq("id", admin_id).execute()
+
+# ========== Master Prompts (Admin Only) ==========
+def list_master_prompts(is_active_only: bool = True) -> List[Dict[str, Any]]:
+    query = sb.table("master_prompts").select("*")
+    if is_active_only:
+        query = query.eq("is_active", True)
+    return query.order("category").order("name").execute().data or []
+
+def get_master_prompt_by_id(prompt_id: str) -> Optional[dict]:
+    res = sb.table("master_prompts").select("*").eq("id", prompt_id).limit(1).execute()
+    return res.data[0] if res.data else None
+
+def get_master_prompt_by_name(name: str) -> Optional[dict]:
+    res = sb.table("master_prompts").select("*").eq("name", name).limit(1).execute()
+    return res.data[0] if res.data else None
+
+def create_master_prompt(name: str, prompt_text: str, description: str = None, 
+                         category: str = None, created_by: str = None) -> dict:
+    data = {
+        "name": name,
+        "prompt_text": prompt_text,
+        "description": description,
+        "category": category,
+        "created_by": created_by,
+        "is_active": True
+    }
+    res = sb.table("master_prompts").insert(data).execute()
+    return res.data[0] if res.data else None
+
+def update_master_prompt(prompt_id: str, **updates) -> dict:
+    updates["updated_at"] = "now()"
+    res = sb.table("master_prompts").update(updates).eq("id", prompt_id).execute()
+    return res.data[0] if res.data else None
+
+# ========== Policies (Enhanced) ==========
+def create_policy(client_id: str, title: str, content: str = None, markdown: str = None,
+                  master_prompt_id: str = None, language: str = "en", 
+                  status: str = "draft") -> dict:
+    data = {
+        "client_id": client_id,
+        "title": title,
+        "content": content,
+        "markdown": markdown,
+        "master_prompt_id": master_prompt_id,
+        "language": language,
+        "status": status
+    }
+    res = sb.table("policies").insert(data).execute()
+    return res.data[0] if res.data else None
+
+def update_policy(policy_id: str, **updates) -> dict:
+    updates["updated_at"] = "now()"
+    res = sb.table("policies").update(updates).eq("id", policy_id).execute()
+    return res.data[0] if res.data else None
+
+def get_policy_by_id(policy_id: str) -> Optional[dict]:
+    res = sb.table("policies").select("*").eq("id", policy_id).limit(1).execute()
+    return res.data[0] if res.data else None
+
+# ========== Client Policies (Many-to-Many) ==========
+def assign_policy_to_client(client_id: str, policy_id: str, assigned_by: str = None) -> dict:
+    data = {
+        "client_id": client_id,
+        "policy_id": policy_id,
+        "assigned_by": assigned_by
+    }
+    res = sb.table("client_policies").insert(data).execute()
+    return res.data[0] if res.data else None
+
+def get_policies_for_client(client_id: str) -> List[Dict[str, Any]]:
+    """Get all policies assigned to a client via client_policies"""
+    res = sb.table("client_policies").select(
+        "policy_id, policies(*)"
+    ).eq("client_id", client_id).execute()
+    return [item["policies"] for item in (res.data or []) if item.get("policies")]

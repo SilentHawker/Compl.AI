@@ -4,6 +4,8 @@ from pydantic import BaseModel
 import os
 import asyncio
 from policy_gen import generate_policy_for_client, get_client_by_name  # existing functions
+from typing import Optional
+import bcrypt
 
 API_KEY = os.getenv("API_KEY", "dev-key")  # set strong key in prod
 
@@ -52,6 +54,81 @@ async def generate(req: GenerateRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"markdown": md}
+
+# ========== Admin Authentication ==========
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class AdminResponse(BaseModel):
+    id: str
+    email: str
+    full_name: str
+    role: str
+
+@app.post("/api/v1/admin/login")
+async def admin_login(req: LoginRequest):
+    """Admin login endpoint"""
+    from db_utils import get_admin_by_email, update_admin_last_login
+
+    admin = get_admin_by_email(req.email)
+    if not admin or not admin.get("is_active"):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # Verify password (bcrypt)
+    try:
+        if not bcrypt.checkpw(req.password.encode(), admin["password_hash"].encode()):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # Update last login
+    update_admin_last_login(admin["id"])
+
+    return {
+        "id": admin["id"],
+        "email": admin["email"],
+        "full_name": admin.get("full_name"),
+        "role": admin.get("role", "admin"),
+        "token": f"admin_{admin['id']}"  # TODO: replace with real JWT in production
+    }
+
+# ========== Master Prompts (Admin Only) ==========
+class MasterPromptRequest(BaseModel):
+    name: str
+    prompt_text: str
+    description: Optional[str] = None
+    category: Optional[str] = None
+
+@app.get("/api/v1/master-prompts", dependencies=[Depends(require_api_key)])
+async def get_master_prompts(is_active: bool = True):
+    """Get all master prompts (admin only)"""
+    from db_utils import list_master_prompts
+    return list_master_prompts(is_active)
+
+@app.post("/api/v1/master-prompts", dependencies=[Depends(require_api_key)])
+async def create_new_master_prompt(req: MasterPromptRequest):
+    """Create a new master prompt (admin only)"""
+    from db_utils import create_master_prompt
+    try:
+        prompt = create_master_prompt(
+            name=req.name,
+            prompt_text=req.prompt_text,
+            description=req.description,
+            category=req.category
+        )
+        return prompt
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/v1/master-prompts/{prompt_id}", dependencies=[Depends(require_api_key)])
+async def get_master_prompt(prompt_id: str):
+    """Get a specific master prompt by ID"""
+    from db_utils import get_master_prompt_by_id
+    prompt = get_master_prompt_by_id(prompt_id)
+    if not prompt:
+        raise HTTPException(status_code=404, detail="Master prompt not found")
+    return prompt
 
 @app.get("/api/v1/policies", dependencies=[Depends(require_api_key)])
 async def list_policies():
