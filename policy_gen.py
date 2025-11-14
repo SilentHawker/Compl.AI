@@ -228,3 +228,108 @@ def generate_policy_for_client(company_name: str, preferred_language: Optional[s
         pass
 
     return policy_md
+
+def generate_gap_suggestions(company_name: str,
+                             existing_policy_md: str,
+                             preferred_language: Optional[str] = None,
+                             max_output_tokens: int = 600) -> list:
+    """
+    Compare `existing_policy_md` to relevant FINTRAC excerpts for the client and return
+    a list of suggested modular edits where the policy is Missing or Partially Present.
+    Each suggestion is a dict with:
+      - id: short unique id
+      - section: suggested section/subsection title
+      - trigger: which regulatory/topic made it in-scope
+      - fintrac_refs: list of short citations/URLs
+      - current_status: "Missing" | "Partial" | "Present"
+      - suggestion_md: markdown snippet to insert/replace
+      - insertion_point: heading text or "end_of_section" (frontend can use to place patch)
+      - rationale: short explanation / remediation text
+    """
+    client = get_client(company_name)
+    if not client:
+        raise RuntimeError(f"Client not found: {company_name}")
+
+    language = preferred_language or client.get("language", "en")
+    regs_text, regs_title = fetch_relevant_text_for_msb(lang=language)
+
+    # build compact comparison prompt
+    preamble = (
+        f"Client:\n- Company: {client['company_name']}\n- Province: {client.get('province','N/A')}\n- Language: {language}\n\n"
+        f"Uploaded policy (brief):\n{(existing_policy_md[:4000] + '...') if existing_policy_md else '[EMPTY]'}\n\n"
+        "Relevant FINTRAC excerpts (MSB):\n"
+    )
+
+    # try to respect token budget / truncate regs if needed
+    body_budget = max_output_tokens
+    prompt_body = preamble + regs_text[:40000]  # conservative truncate
+    prompt_instructions = (
+        "\n\nTask: Compare the uploaded policy to the provided FINTRAC excerpts. "
+        "For each required obligation or section that is Missing or Partially Present in the uploaded policy, "
+        "produce one suggestion object. Output a JSON array only. Each object must include the fields: "
+        "id, section, trigger, fintrac_refs (array of short citations or URLs), current_status (Missing|Partial|Present), "
+        "suggestion_md (a concise markdown snippet to insert), insertion_point (heading text or 'end_of_section'), and rationale (1-2 sentences). "
+        "Keep suggestion_md short (1-6 paragraphs). Prefer conservative compliance language. "
+        "Do NOT include the entire full policy — only modular suggestion snippets. "
+        "If a requirement is Not Applicable, do not include it."
+    )
+
+    user_prompt = prompt_body + "\n\n" + prompt_instructions
+
+    try:
+        resp = llm.generate_text(user_prompt, max_output_tokens=max_output_tokens, temperature=0.0)
+        text = llm.text_for(resp) if hasattr(llm, "text_for") else str(resp)
+    except Exception as e:
+        raise RuntimeError(f"LLM generation failed: {e}") from e
+
+    # attempt to parse JSON from the model output
+    suggestions = []
+    try:
+        # try direct JSON
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            suggestions = parsed
+        elif isinstance(parsed, dict) and parsed.get("suggestions"):
+            suggestions = parsed["suggestions"]
+    except Exception:
+        # try to extract first JSON array present
+        m = re.search(r"(\[\s*{[\s\S]*}\s*\])", text)
+        if m:
+            try:
+                suggestions = json.loads(m.group(1))
+            except Exception:
+                suggestions = []
+        else:
+            # fallback: heuristic split by headings — produce minimal suggestion indicating failure to parse
+            suggestions = [{
+                "id": "suggestion_parse_error",
+                "section": "Parsing / Analysis",
+                "trigger": "internal",
+                "fintrac_refs": [],
+                "current_status": "Partial",
+                "suggestion_md": "LLM returned an unexpected format. Please re-run the analysis or check the logs.",
+                "insertion_point": "preface",
+                "rationale": "Unable to parse LLM JSON output; this indicates the model did not return structured JSON."
+            }]
+
+    # Normalize each suggestion to expected keys and small sanity checks
+    normalized = []
+    for i, s in enumerate(suggestions):
+        try:
+            sid = s.get("id") if isinstance(s, dict) else None
+            if not sid:
+                sid = f"sugg_{i}"
+            normalized.append({
+                "id": sid,
+                "section": (s.get("section") if isinstance(s, dict) else s) or "Unspecified",
+                "trigger": (s.get("trigger") if isinstance(s, dict) else "") or "",
+                "fintrac_refs": s.get("fintrac_refs") if isinstance(s, dict) and isinstance(s.get("fintrac_refs"), list) else [],
+                "current_status": (s.get("current_status") if isinstance(s, dict) else "Missing") or "Missing",
+                "suggestion_md": (s.get("suggestion_md") if isinstance(s, dict) else "") or "",
+                "insertion_point": (s.get("insertion_point") if isinstance(s, dict) else "end_of_section") or "end_of_section",
+                "rationale": (s.get("rationale") if isinstance(s, dict) else "") or ""
+            })
+        except Exception:
+            continue
+
+    return normalized
