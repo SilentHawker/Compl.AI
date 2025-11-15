@@ -17,6 +17,7 @@ from google.api_core.exceptions import GoogleAPIError
 # FastAPI backend
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import asyncio
 
@@ -68,14 +69,22 @@ API_KEY = os.getenv("API_KEY", "dev-key")
 # FastAPI app
 app = FastAPI(title="Compl.AI Backend")
 
-# Configure CORS (adjust origins in production)
-origins = os.getenv("CORS_ORIGINS", "*").split(",") if os.getenv("CORS_ORIGINS") else ["*"]
+# CORS configuration for Google AI Studio and ngrok
+ngrok_url = os.getenv("NGROK_URL")
+origins = ["https://studio.googleapis.com", "http://localhost:3000"]
+if ngrok_url:
+    origins.append(ngrok_url.rstrip("/"))
+
+# Allow all origins in dev if NGROK_URL not set
+allow_all = os.getenv("ENV", "dev") != "prod" and not ngrok_url
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"] if allow_all else origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["x-total-count", "x-request-id"]
 )
 
 # ---------- AUTH DEPENDENCY (ensure defined before endpoints) ----------
@@ -219,6 +228,14 @@ async def _load_secrets_on_startup():
                 print(f"Loaded secret into env: {env_name}")
         except Exception as e:
             print(f"Failed to load secret {secret_id}: {e}")
+
+# Startup debug check for API_KEY
+@app.on_event("startup")
+def _check_api_key_present():
+    v = (os.getenv("API_KEY") or "").strip().lstrip("\ufeff")
+    print("API_KEY present in env:", bool(v))
+    if not v:
+        print("WARNING: API_KEY not set in environment (.env or env vars).")
 
 # -------- request/response models ----------
 class GenerateRequest(BaseModel):

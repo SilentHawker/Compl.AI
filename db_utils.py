@@ -158,9 +158,13 @@ def create_master_prompt(name: str, prompt_text: str, description: str = None,
     return res.data[0] if res.data else None
 
 def update_master_prompt(prompt_id: str, **updates) -> dict:
-    updates["updated_at"] = "now()"
+    """Update a master prompt and return the updated record"""
+    from datetime import datetime
+    updates["updated_at"] = datetime.utcnow().isoformat()
     res = sb.table("master_prompts").update(updates).eq("id", prompt_id).execute()
-    return res.data[0] if res.data else None
+    if not res.data:
+        raise Exception(f"Failed to update master prompt {prompt_id}")
+    return res.data[0]
 
 # ========== Policies (Enhanced) ==========
 def create_policy(client_id: str, title: str, content: str = None, markdown: str = None,
