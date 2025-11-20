@@ -69,16 +69,16 @@ def get_policies_by_client(client_id: str) -> List[Dict[str, Any]]:
 # ---------- Regulations (Sources) ----------
 def list_sources() -> List[Dict[str, Any]]:
     return (sb.table("regulations")
-              .select("id,title,source,category,url,last_fetched,last_updated,content_hash,current_version_no")
-              .order("title")
+              .select("id,name,source,category,url,last_fetched,last_updated,content_hash,current_version_no")
+              .order("name")
               .execute().data or [])
 
 # ---------- Versioning ----------
 def list_registrations_for_versions() -> List[Dict[str, Any]]:
     return (sb.table("regulations")
-              .select("id,title,source,category,url,current_version_no,last_updated,last_fetched")
+              .select("id,name,source,category,url,current_version_no,last_updated,last_fetched")
               .order("source")
-              .order("title")
+              .order("name")
               .execute().data or [])
 
 def list_versions(regulation_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -167,12 +167,12 @@ def update_master_prompt(prompt_id: str, **updates) -> dict:
     return res.data[0]
 
 # ========== Policies (Enhanced) ==========
-def create_policy(client_id: str, title: str, content: str = None, markdown: str = None,
+def create_policy(client_id: str, name: str, content: str = None, markdown: str = None,
                   master_prompt_id: str = None, language: str = "en", 
                   status: str = "draft") -> dict:
     data = {
         "client_id": client_id,
-        "title": title,
+        "name": name,
         "content": content,
         "markdown": markdown,
         "master_prompt_id": master_prompt_id,

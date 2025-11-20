@@ -92,6 +92,22 @@ class MasterPromptUpdate(BaseModel):
     category: Optional[str] = None
     is_active: Optional[bool] = None
 
+class ClientProfileUpdate(BaseModel):
+    """Update company profile details"""
+    company_name: Optional[str] = None
+    operating_name: Optional[str] = None
+    fintrac_reg_number: Optional[str] = None
+    business_address: Optional[str] = None
+    business_lines: Optional[List[str]] = None
+
+class ClientTeamMemberRequest(BaseModel):
+    """Create or update team member"""
+    email: str
+    full_name: str
+    role: str
+    phone: Optional[str] = None
+    notification_preferences: Optional[List[str]] = ["email"]
+
 @app.get("/api/v1/master-prompts", dependencies=[Depends(require_api_key)])
 async def get_master_prompts(is_active: Optional[bool] = None):
     """Get all master prompts (admin only). Filter by is_active if provided."""
@@ -313,15 +329,6 @@ async def create_client(payload: ClientCreateRequest):
             return JSONResponse(status_code=409, content={"detail": "duplicate client", "db_error": err_obj})
         raise HTTPException(status_code=500, detail=f"Database error: {err_obj}")
 
-@app.get("/api/v1/clients", dependencies=[Depends(require_api_key)])
-async def list_clients():
-    """Get all clients"""
-    try:
-        result = sb.table("clients").select("*").execute()
-        return result.data if result.data else []
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/api/v1/admin/clients", dependencies=[Depends(require_api_key)])
 async def list_clients_admin():
     """Get all clients (admin route for tenant switcher)"""
@@ -334,46 +341,73 @@ async def list_clients_admin():
 
 @app.get("/api/v1/clients/{tenant_id}", dependencies=[Depends(require_api_key)])
 async def get_client_profile(tenant_id: str):
-    """Get full client profile including onboarding data"""
+    """Get full client profile including onboarding data and team members"""
     try:
+        # Get client data
         result = sb.table("clients").select("*").eq("id", tenant_id).limit(1).execute()
         if not result.data:
             raise HTTPException(status_code=404, detail="Client not found")
         
-        # Map to frontend expected format
         client = result.data[0]
+        
+        # Get latest questionnaire if exists
+        questionnaire_result = sb.table("onboarding_questionnaires").select("*").eq("client_id", tenant_id).limit(1).execute()
+        questionnaire_data = questionnaire_result.data[0] if questionnaire_result.data else None
+        
+        # Get team members/employees
+        team_members_result = sb.table("client_team_members").select("*").eq("client_id", tenant_id).execute()
+        team_members = team_members_result.data if team_members_result.data else []
+        
+        # Map team members to frontend expected format
+        employees = []
+        for member in team_members:
+            employees.append({
+                "id": member.get("id"),
+                "name": member.get("full_name"),
+                "email": member.get("email"),
+                "phone": member.get("phone"),
+                "role": member.get("role"),
+                "notificationPreferences": member.get("notification_preferences", ["email"])
+            })
+        
+        # Map to frontend expected format
         return {
             "client_id": client.get("id"),
             "company_name": client.get("company_name"),
             "operating_name": client.get("operating_name"),
-            "fintrac_reg_number": client.get("fintrac_reg_number"),
+            "fintrac_reg_number": questionnaire_data.get("fintrac_reg_number") if questionnaire_data else client.get("fintrac_reg_number"),
             "business_address": client.get("business_address"),
             "business_lines": client.get("business_lines", []),
-            "employees": client.get("employees", []),
-            "onboarding_data": client.get("onboarding_data", {})
+            "employees": employees,
+            "onboarding_data": questionnaire_data.get("answers") if questionnaire_data else client.get("onboarding_data", {})
         }
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.put("/api/v1/clients/{tenant_id}", dependencies=[Depends(require_api_key)])
-async def update_client_profile(tenant_id: str, profile: CompanyProfileUpdate):
-    """Update client profile including onboarding questionnaire data"""
+@app.put("/api/v1/clients/{client_id}", dependencies=[Depends(require_api_key)])
+async def update_client_profile_full(client_id: str, profile: ClientProfileUpdate):
+    """Update client company profile details"""
     try:
         update_data = {}
         if profile.company_name is not None:
             update_data["company_name"] = profile.company_name
-        if profile.province is not None:
-            update_data["province"] = profile.province
-        if profile.language is not None:
-            update_data["language"] = profile.language
-        if profile.onboarding_data is not None:
-            update_data["onboarding_data"] = profile.onboarding_data.model_dump(exclude_none=True)
+        if profile.operating_name is not None:
+            update_data["operating_name"] = profile.operating_name
+        if profile.fintrac_reg_number is not None:
+            update_data["fintrac_reg_number"] = profile.fintrac_reg_number
+        if profile.business_address is not None:
+            update_data["business_address"] = profile.business_address
+        if profile.business_lines is not None:
+            update_data["business_lines"] = profile.business_lines
+        
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No fields provided to update")
         
         update_data["updated_at"] = datetime.utcnow().isoformat()
         
-        result = sb.table("clients").update(update_data).eq("id", tenant_id).execute()
+        result = sb.table("clients").update(update_data).eq("id", client_id).execute()
         if not result.data:
             raise HTTPException(status_code=404, detail="Client not found")
         return result.data[0]
@@ -382,183 +416,97 @@ async def update_client_profile(tenant_id: str, profile: CompanyProfileUpdate):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/v1/admin/profile/{tenant_id}", dependencies=[Depends(require_api_key)])
-async def get_tenant_profile(tenant_id: str):
-    """Get tenant/client profile by ID (alias for backwards compatibility)"""
-    return await get_client_profile(tenant_id)
+# ========== Client Team Members (Employees) ==========
 
-# ========== Onboarding ==========
-
-@app.post("/api/v1/clients/{tenant_id}/onboarding", dependencies=[Depends(require_api_key)])
-async def save_onboarding_data(tenant_id: str, data: OnboardingData):
-    """Save or update onboarding questionnaire data for a client"""
+@app.get("/api/v1/clients/{client_id}/users", dependencies=[Depends(require_api_key)])
+async def list_client_team_members(client_id: str):
+    """Get all team members/employees for a client"""
     try:
+        result = sb.table("client_team_members").select("*").eq("client_id", client_id).execute()
+        return result.data if result.data else []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/clients/{client_id}/users", dependencies=[Depends(require_api_key)])
+async def create_client_team_member(client_id: str, member: ClientTeamMemberRequest):
+    """Create a new team member/employee for a client"""
+    try:
+        # Verify client exists
+        client_check = sb.table("clients").select("id").eq("id", client_id).limit(1).execute()
+        if not client_check.data:
+            raise HTTPException(status_code=404, detail="Client not found")
+        
+        # Check for duplicate email within this client
+        existing = sb.table("client_team_members").select("id").eq("client_id", client_id).eq("email", member.email.lower()).limit(1).execute()
+        if existing.data:
+            raise HTTPException(status_code=409, detail="Team member with this email already exists for this client")
+        
+        member_data = {
+            "client_id": client_id,
+            "email": member.email.strip().lower(),
+            "full_name": member.full_name.strip(),
+            "role": member.role.strip(),
+            "phone": member.phone.strip() if member.phone else None,
+            "notification_preferences": member.notification_preferences or ["email"],
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        result = sb.table("client_team_members").insert(member_data).execute()
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create team member")
+        
+        return result.data[0]
+    except HTTPException:
+        raise
+    except APIError as e:
+        err_msg = str(e)
+        if "duplicate key" in err_msg.lower() or "unique" in err_msg.lower():
+            raise HTTPException(status_code=409, detail="Team member with this email already exists")
+        raise HTTPException(status_code=500, detail=f"Database error: {err_msg}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/v1/clients/{client_id}/users/{user_id}", dependencies=[Depends(require_api_key)])
+async def update_client_team_member(client_id: str, user_id: str, member: ClientTeamMemberRequest):
+    """Update an existing team member/employee"""
+    try:
+        # Verify the team member exists and belongs to this client
+        existing = sb.table("client_team_members").select("id").eq("id", user_id).eq("client_id", client_id).limit(1).execute()
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Team member not found")
+        
         update_data = {
-            "onboarding_data": data.model_dump(exclude_none=True),
+            "email": member.email.strip().lower(),
+            "full_name": member.full_name.strip(),
+            "role": member.role.strip(),
+            "phone": member.phone.strip() if member.phone else None,
+            "notification_preferences": member.notification_preferences or ["email"],
             "updated_at": datetime.utcnow().isoformat()
         }
         
-        result = sb.table("clients").update(update_data).eq("id", tenant_id).execute()
+        result = sb.table("client_team_members").update(update_data).eq("id", user_id).eq("client_id", client_id).execute()
         if not result.data:
-            raise HTTPException(status_code=404, detail="Client not found")
-        return {"ok": True, "data": result.data[0]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/v1/clients/{tenant_id}/onboarding", dependencies=[Depends(require_api_key)])
-async def get_onboarding_data(tenant_id: str):
-    """Get onboarding questionnaire data for a client"""
-    try:
-        result = sb.table("clients").select("id,company_name,onboarding_data").eq("id", tenant_id).limit(1).execute()
-        if not result.data:
-            raise HTTPException(status_code=404, detail="Client not found")
+            raise HTTPException(status_code=404, detail="Team member not found")
+        
         return result.data[0]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ========== Policies ==========
-
-@app.get("/api/v1/policies", dependencies=[Depends(require_api_key)])
-async def list_policies():
-    """Get all policies"""
-    from db_utils import list_policies as db_list_policies
-    return db_list_policies(None)
-
-@app.post("/api/v1/policies", dependencies=[Depends(require_api_key)])
-async def create_new_policy(req: PolicyRequest):
-    """Create a new policy"""
-    from db_utils import create_policy
+@app.delete("/api/v1/clients/{client_id}/users/{user_id}", dependencies=[Depends(require_api_key)])
+async def delete_client_team_member(client_id: str, user_id: str):
+    """Delete a team member/employee"""
     try:
-        policy = create_policy(
-            client_id=req.client_id,
-            title=req.title,
-            content=req.content,
-            markdown=req.markdown,
-            master_prompt_id=req.master_prompt_id,
-            language=req.language,
-            status=req.status
-        )
-        return policy
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.get("/api/v1/policies/{policy_id}", dependencies=[Depends(require_api_key)])
-async def get_policy(policy_id: str):
-    """Get a specific policy by ID"""
-    from db_utils import get_policy_by_id
-    policy = get_policy_by_id(policy_id)
-    if not policy:
-        raise HTTPException(status_code=404, detail="Policy not found")
-    return policy
-
-@app.post("/api/v1/clients/{client_id}/policies/{policy_id}", dependencies=[Depends(require_api_key)])
-async def assign_policy(client_id: str, policy_id: str):
-    """Assign a policy to a client"""
-    from db_utils import assign_policy_to_client
-    try:
-        result = assign_policy_to_client(client_id, policy_id)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-# ========== Policy Generation (AI) ==========
-
-@app.post("/api/v1/generate", response_model=GenerateResponse, dependencies=[Depends(require_api_key)])
-async def generate(req: GenerateRequest):
-    """Generate a policy using AI"""
-    client = get_client_by_name(req.company_name)
-    if not client:
-        raise HTTPException(status_code=404, detail="client not found")
-    
-    loop = asyncio.get_running_loop()
-    try:
-        md = await loop.run_in_executor(
-            None,
-            generate_policy_for_client,
-            req.company_name,
-            req.language,
-            req.custom_prompt
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    return {"markdown": md}
-
-# ========== Master Prompts ==========
-
-@app.get("/api/v1/master-prompts", dependencies=[Depends(require_api_key)])
-async def get_master_prompts(is_active: Optional[bool] = None):
-    """Get all master prompts with optional active filter"""
-    from db_utils import list_master_prompts
-    if is_active is None:
-        return list_master_prompts(is_active_only=False)
-    return list_master_prompts(is_active_only=is_active)
-
-@app.post("/api/v1/master-prompts", dependencies=[Depends(require_api_key)])
-async def create_new_master_prompt(req: MasterPromptRequest):
-    """Create a new master prompt"""
-    from db_utils import create_master_prompt
-    try:
-        prompt = create_master_prompt(
-            name=req.name,
-            prompt_text=req.prompt_text,
-            description=req.description,
-            category=req.category
-        )
-        return prompt
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.get("/api/v1/master-prompts/{prompt_id}", dependencies=[Depends(require_api_key)])
-async def get_master_prompt(prompt_id: str):
-    """Get a specific master prompt by ID"""
-    from db_utils import get_master_prompt_by_id
-    prompt = get_master_prompt_by_id(prompt_id)
-    if not prompt:
-        raise HTTPException(status_code=404, detail="Master prompt not found")
-    return prompt
-
-@app.put("/api/v1/master-prompts/{prompt_id}", dependencies=[Depends(require_api_key)])
-async def update_master_prompt_endpoint(prompt_id: str, updates: MasterPromptUpdate):
-    """Update an existing master prompt"""
-    from db_utils import update_master_prompt, get_master_prompt_by_id
-    
-    existing = get_master_prompt_by_id(prompt_id)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Master prompt not found")
-    
-    try:
-        update_data = {}
-        if updates.name is not None:
-            update_data["name"] = updates.name
-        if updates.prompt_text is not None:
-            update_data["prompt_text"] = updates.prompt_text
-        if updates.description is not None:
-            update_data["description"] = updates.description
-        if updates.category is not None:
-            update_data["category"] = updates.category
-        if updates.is_active is not None:
-            update_data["is_active"] = updates.is_active
+        # Verify the team member exists and belongs to this client
+        existing = sb.table("client_team_members").select("id").eq("id", user_id).eq("client_id", client_id).limit(1).execute()
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Team member not found")
         
-        if not update_data:
-            raise HTTPException(status_code=400, detail="No fields provided to update")
-        
-        updated_prompt = update_master_prompt(prompt_id, **update_data)
-        return updated_prompt
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/api/v1/master-prompts/{prompt_id}", dependencies=[Depends(require_api_key)])
-async def delete_master_prompt_endpoint(prompt_id: str):
-    """Soft delete a master prompt by setting is_active=false"""
-    from db_utils import update_master_prompt, get_master_prompt_by_id
-    
-    existing = get_master_prompt_by_id(prompt_id)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Master prompt not found")
-    
-    try:
-        update_master_prompt(prompt_id, is_active=False)
-        return {"ok": True, "message": "Master prompt deactivated"}
+        sb.table("client_team_members").delete().eq("id", user_id).eq("client_id", client_id).execute()
+        return Response(status_code=204)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -809,3 +757,208 @@ async def log_requests(request: Request, call_next):
     except Exception as e:
         print(f"❌ {request.method} {request.url.path} -> ERROR: {e}")
         raise
+
+class QuestionnaireSubmission(BaseModel):
+    client_id: str
+    answers: dict
+    company_legal_name: Optional[str] = None
+    fintrac_reg_number: Optional[str] = None
+
+@app.post("/api/v1/onboarding-questionnaires", dependencies=[Depends(require_api_key)])
+async def submit_questionnaire(submission: QuestionnaireSubmission):
+    """Create or update onboarding questionnaire submission"""
+    try:
+        # Check if questionnaire already exists for this client
+        existing = sb.table("onboarding_questionnaires").select("id").eq("client_id", submission.client_id).limit(1).execute()
+        
+        questionnaire_data = {
+            "client_id": submission.client_id,
+            "answers": submission.answers,
+            "company_legal_name": submission.company_legal_name,
+            "fintrac_reg_number": submission.fintrac_reg_number,
+            "submitted_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+        if existing.data:
+            # Update existing questionnaire
+            result = sb.table("onboarding_questionnaires").update(questionnaire_data).eq("client_id", submission.client_id).execute()
+        else:
+            # Create new questionnaire
+            result = sb.table("onboarding_questionnaires").insert(questionnaire_data).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to save questionnaire")
+        
+        # Also update the client's onboarding_data field for easy access
+        sb.table("clients").update({
+            "onboarding_data": submission.answers,
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("id", submission.client_id).execute()
+        
+        return {"ok": True, "data": result.data[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ========== Client Users Management ==========
+
+class ClientUserRequest(BaseModel):
+    client_id: str
+    email: str
+    full_name: str
+    password: str
+    role: str = "client"  # client, manager, admin
+
+@app.post("/api/v1/admin/users", dependencies=[Depends(require_api_key)])
+async def create_client_user(user: ClientUserRequest):
+    """Create a new client user account (Admin only)"""
+    try:
+        # Validate role
+        if user.role not in ["client", "manager", "admin"]:
+            raise HTTPException(status_code=400, detail="Invalid role. Must be 'client', 'manager', or 'admin'")
+        
+        # Check if client exists
+        client_check = sb.table("clients").select("id").eq("id", user.client_id).limit(1).execute()
+        if not client_check.data:
+            raise HTTPException(status_code=404, detail="Client not found")
+        
+        # Check if user with this email already exists
+        existing_user = sb.table("client_users").select("id,email").eq("email", user.email).limit(1).execute()
+        if existing_user.data:
+            raise HTTPException(status_code=409, detail="User with this email already exists")
+        
+        # Hash the password
+        password_hash = bcrypt.hashpw(user.password.encode(), bcrypt.gensalt()).decode()
+        
+        # Create the user
+        user_data = {
+            "client_id": user.client_id,
+            "email": user.email.strip().lower(),
+            "full_name": user.full_name.strip(),
+            "password_hash": password_hash,
+            "role": user.role,
+            "is_active": True,
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        result = sb.table("client_users").insert(user_data).execute()
+        
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create user")
+        
+        # Return user info without password hash
+        created_user = result.data[0]
+        return {
+            "id": created_user.get("id"),
+            "client_id": created_user.get("client_id"),
+            "email": created_user.get("email"),
+            "full_name": created_user.get("full_name"),
+            "role": created_user.get("role"),
+            "is_active": created_user.get("is_active"),
+            "created_at": created_user.get("created_at")
+        }
+        
+    except HTTPException:
+        raise
+    except APIError as e:
+        err_msg = str(e)
+        if "duplicate key" in err_msg.lower() or "unique" in err_msg.lower():
+            raise HTTPException(status_code=409, detail="User with this email already exists")
+        raise HTTPException(status_code=500, detail=f"Database error: {err_msg}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/admin/users", dependencies=[Depends(require_api_key)])
+async def list_client_users(client_id: Optional[str] = None):
+    """List all client users, optionally filtered by client_id"""
+    try:
+        query = sb.table("client_users").select("id,client_id,email,full_name,role,is_active,created_at,last_login")
+        
+        if client_id:
+            query = query.eq("client_id", client_id)
+        
+        result = query.execute()
+        return result.data if result.data else []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/admin/users/{user_id}", dependencies=[Depends(require_api_key)])
+async def get_client_user(user_id: str):
+    """Get a specific client user by ID"""
+    try:
+        result = sb.table("client_users").select("id,client_id,email,full_name,role,is_active,created_at,last_login").eq("id", user_id).limit(1).execute()
+        if not result.data:
+            raise HTTPException(status_code=404, detail="User not found")
+        return result.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/v1/admin/users/{user_id}", dependencies=[Depends(require_api_key)])
+async def update_client_user(user_id: str, updates: dict):
+    """Update a client user (email, full_name, role, is_active, password)"""
+    try:
+        # Check if user exists
+        existing = sb.table("client_users").select("id").eq("id", user_id).limit(1).execute()
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        update_data = {}
+        
+        # Handle password update separately (needs hashing)
+        if "password" in updates:
+            password_hash = bcrypt.hashpw(updates["password"].encode(), bcrypt.gensalt()).decode()
+            update_data["password_hash"] = password_hash
+        
+        # Handle other fields
+        allowed_fields = ["email", "full_name", "role", "is_active"]
+        for field in allowed_fields:
+            if field in updates:
+                update_data[field] = updates[field]
+        
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No valid fields provided to update")
+        
+        update_data["updated_at"] = datetime.utcnow().isoformat()
+        
+        result = sb.table("client_users").update(update_data).eq("id", user_id).execute()
+        if not result.data:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Return without password hash
+        updated_user = result.data[0]
+        return {
+            "id": updated_user.get("id"),
+            "client_id": updated_user.get("client_id"),
+            "email": updated_user.get("email"),
+            "full_name": updated_user.get("full_name"),
+            "role": updated_user.get("role"),
+            "is_active": updated_user.get("is_active"),
+            "updated_at": updated_user.get("updated_at")
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/v1/admin/users/{user_id}", dependencies=[Depends(require_api_key)])
+async def delete_client_user(user_id: str):
+    """Soft delete a client user by setting is_active=false"""
+    try:
+        existing = sb.table("client_users").select("id").eq("id", user_id).limit(1).execute()
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        sb.table("client_users").update({
+            "is_active": False,
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("id", user_id).execute()
+        
+        return {"ok": True, "message": "User deactivated"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
