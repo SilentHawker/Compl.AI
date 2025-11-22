@@ -17,6 +17,7 @@ from typing import Optional, List
 import bcrypt
 import jwt
 from datetime import datetime, timedelta
+from regulation_scraper import process_all_regulations, process_single_regulation
 
 # JWT secret (set via env in production)
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-prod")
@@ -92,6 +93,59 @@ class MasterPromptUpdate(BaseModel):
     category: Optional[str] = None
     is_active: Optional[bool] = None
 
+class PolicyRequest(BaseModel):
+    client_id: str
+    title: str
+    content: Optional[str] = None
+    markdown: Optional[str] = None
+    master_prompt_id: Optional[str] = None
+    language: str = "en"
+    status: str = "draft"
+
+class OnboardingData(BaseModel):
+    """Questionnaire data structure matching frontend types"""
+    company_legal_name: Optional[str] = None
+    operating_name: Optional[str] = None
+    business_number: Optional[str] = None
+    incorporation_date: Optional[str] = None
+    jurisdiction_incorporation: Optional[str] = None
+    principal_address: Optional[str] = None
+    mailing_address: Optional[str] = None
+    business_phone: Optional[str] = None
+    business_email: Optional[str] = None
+    website: Optional[str] = None
+    is_msb_registered: Optional[bool] = None
+    fintrac_reg_number: Optional[str] = None
+    msb_registration_date: Optional[str] = None
+    jurisdictions: Optional[list[str]] = None
+    msb_activities: Optional[list[str]] = None
+    has_agents: Optional[bool] = None
+    num_agents: Optional[int] = None
+    agent_locations: Optional[str] = None
+    compliance_officer_name: Optional[str] = None
+    compliance_officer_email: Optional[str] = None
+    compliance_officer_phone: Optional[str] = None
+    aml_program_exists: Optional[bool] = None
+    last_risk_assessment_date: Optional[str] = None
+    high_risk_countries: Optional[bool] = None
+    pep_dealings: Optional[bool] = None
+    cash_intensive: Optional[bool] = None
+    virtual_currency: Optional[bool] = None
+    international_wires: Optional[bool] = None
+    third_party_processors: Optional[bool] = None
+    customer_types: Optional[list[str]] = None
+    avg_transaction_volume: Optional[str] = None
+    monthly_transaction_count: Optional[str] = None
+    largest_transaction: Optional[str] = None
+    existing_policies: Optional[list[str]] = None
+    policy_update_frequency: Optional[str] = None
+    training_frequency: Optional[str] = None
+    record_keeping_system: Optional[str] = None
+    reporting_mechanism: Optional[str] = None
+    past_regulatory_issues: Optional[bool] = None
+    regulatory_issue_details: Optional[str] = None
+    additional_notes: Optional[str] = None
+
 class ClientProfileUpdate(BaseModel):
     """Update company profile details"""
     company_name: Optional[str] = None
@@ -99,6 +153,9 @@ class ClientProfileUpdate(BaseModel):
     fintrac_reg_number: Optional[str] = None
     business_address: Optional[str] = None
     business_lines: Optional[List[str]] = None
+    province: Optional[str] = None
+    language: Optional[str] = None
+    onboarding_data: Optional[OnboardingData] = None
 
 class ClientTeamMemberRequest(BaseModel):
     """Create or update team member"""
@@ -107,6 +164,40 @@ class ClientTeamMemberRequest(BaseModel):
     role: str
     phone: Optional[str] = None
     notification_preferences: Optional[List[str]] = ["email"]
+
+class QuestionnaireSubmission(BaseModel):
+    client_id: str
+    answers: dict
+    company_legal_name: Optional[str] = None
+    fintrac_reg_number: Optional[str] = None
+
+class ClientUserRequest(BaseModel):
+    client_id: str
+    email: str
+    full_name: str
+    password: str
+    role: str = "client"  # client, manager, admin
+
+class RegulationRequest(BaseModel):
+    name: str
+    link: str
+    interpretation: str
+    business_lines: Optional[List[str]] = []
+
+class RegulationUpdate(BaseModel):
+    name: Optional[str] = None
+    link: Optional[str] = None
+    interpretation: Optional[str] = None
+    business_lines: Optional[List[str]] = None
+    status: Optional[str] = None
+    status_message: Optional[str] = None
+
+class BusinessLineRequest(BaseModel):
+    name: str
+
+# Now remove the duplicate OnboardingData definition at line ~263
+# And remove duplicate QuestionnaireSubmission at line ~814
+# And remove duplicate ClientUserRequest at line ~861
 
 @app.get("/api/v1/master-prompts", dependencies=[Depends(require_api_key)])
 async def get_master_prompts(is_active: Optional[bool] = None):
@@ -195,71 +286,52 @@ async def list_policies():
     from db_utils import list_policies as db_list_policies
     return db_list_policies(None)
 
-# ========== Policies CRUD & Assignment ==========
-from pydantic import BaseModel
-from typing import Optional
+@app.post("/api/v1/generate", response_model=GenerateResponse, dependencies=[Depends(require_api_key)])
+async def generate(req: GenerateRequest):
+    """Generate a policy using AI"""
+    client = get_client_by_name(req.company_name)
+    if not client:
+        raise HTTPException(status_code=404, detail="client not found")
+    
+    loop = asyncio.get_running_loop()
+    try:
+        md = await loop.run_in_executor(
+            None,
+            generate_policy_for_client,
+            req.company_name,
+            req.language,
+            req.custom_prompt
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"markdown": md}
 
-class PolicyRequest(BaseModel):
-    client_id: str
-    title: str
-    content: Optional[str] = None
-    markdown: Optional[str] = None
-    master_prompt_id: Optional[str] = None
-    language: str = "en"
-    status: str = "draft"
+@app.post("/api/v1/policies", dependencies=[Depends(require_api_key)])
+async def create_new_policy(req: PolicyRequest):
+    """Create a new policy"""
+    from db_utils import create_policy
+    try:
+        policy = create_policy(
+            client_id=req.client_id,
+            title=req.title,
+            content=req.content,
+            markdown=req.markdown,
+            master_prompt_id=req.master_prompt_id,
+            language=req.language,
+            status=req.status
+        )
+        return policy
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-class OnboardingData(BaseModel):
-    """Questionnaire data structure matching frontend types"""
-    company_legal_name: Optional[str] = None
-    operating_name: Optional[str] = None
-    business_number: Optional[str] = None
-    incorporation_date: Optional[str] = None
-    jurisdiction_incorporation: Optional[str] = None
-    principal_address: Optional[str] = None
-    mailing_address: Optional[str] = None
-    business_phone: Optional[str] = None
-    business_email: Optional[str] = None
-    website: Optional[str] = None
-    is_msb_registered: Optional[bool] = None
-    fintrac_reg_number: Optional[str] = None
-    msb_registration_date: Optional[str] = None
-    jurisdictions: Optional[list[str]] = None
-    msb_activities: Optional[list[str]] = None
-    has_agents: Optional[bool] = None
-    num_agents: Optional[int] = None
-    agent_locations: Optional[str] = None
-    compliance_officer_name: Optional[str] = None
-    compliance_officer_email: Optional[str] = None
-    compliance_officer_phone: Optional[str] = None
-    aml_program_exists: Optional[bool] = None
-    last_risk_assessment_date: Optional[str] = None
-    high_risk_countries: Optional[bool] = None
-    pep_dealings: Optional[bool] = None
-    cash_intensive: Optional[bool] = None
-    virtual_currency: Optional[bool] = None
-    international_wires: Optional[bool] = None
-    third_party_processors: Optional[bool] = None
-    customer_types: Optional[list[str]] = None
-    avg_transaction_volume: Optional[str] = None
-    monthly_transaction_count: Optional[str] = None
-    largest_transaction: Optional[str] = None
-    existing_policies: Optional[list[str]] = None
-    policy_update_frequency: Optional[str] = None
-    training_frequency: Optional[str] = None
-    record_keeping_system: Optional[str] = None
-    reporting_mechanism: Optional[str] = None
-    past_regulatory_issues: Optional[bool] = None
-    regulatory_issue_details: Optional[str] = None
-    additional_notes: Optional[str] = None
-
-class CompanyProfileUpdate(BaseModel):
-    """Full profile update including onboarding data"""
-    company_name: Optional[str] = None
-    province: Optional[str] = None
-    language: Optional[str] = None
-    onboarding_data: Optional[OnboardingData] = None
-
-# ========== Health Check ==========
+@app.get("/api/v1/policies/{policy_id}", dependencies=[Depends(require_api_key)])
+async def get_policy(policy_id: str):
+    """Get a specific policy by ID"""
+    from db_utils import get_policy_by_id
+    policy = get_policy_by_id(policy_id)
+    if not policy:
+        raise HTTPException(status_code=404, detail="Policy not found")
+    return policy
 
 @app.get("/health")
 async def health():
@@ -510,39 +582,7 @@ async def delete_client_team_member(client_id: str, user_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ========== Regulations/Sources ==========
-
-@app.get("/api/v1/sources", dependencies=[Depends(require_api_key)])
-async def list_regulations():
-    """Get all regulatory sources"""
-    try:
-        result = sb.table("regulations").select("*").execute()
-        # Map to frontend expected format
-        regulations = []
-        for reg in (result.data or []):
-            regulations.append({
-                "id": reg.get("id"),
-                "name": reg.get("name"),
-                "link": reg.get("link"),
-                "interpretation": reg.get("interpretation"),
-                "isVerified": reg.get("is_verified", True),
-                "createdAt": reg.get("created_at"),
-                "businessLine": reg.get("business_line")
-            })
-        return regulations
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Alias for backwards compatibility
-@app.get("/api/v1/admin/regulations", dependencies=[Depends(require_api_key)])
-async def list_regulations_admin():
-    """Get all regulations (admin alias)"""
-    return await list_regulations()
-
 # ========== Business Lines ==========
-
-class BusinessLineRequest(BaseModel):
-    name: str
 
 @app.get("/api/v1/business-lines", dependencies=[Depends(require_api_key)])
 async def list_business_lines():
@@ -578,21 +618,7 @@ async def delete_business_line(business_line_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ========== Enhanced Regulations Management ==========
-
-class RegulationRequest(BaseModel):
-    name: str
-    link: str
-    interpretation: str
-    business_lines: Optional[List[str]] = []
-
-class RegulationUpdate(BaseModel):
-    name: Optional[str] = None
-    link: Optional[str] = None
-    interpretation: Optional[str] = None
-    business_lines: Optional[List[str]] = None
-    status: Optional[str] = None
-    status_message: Optional[str] = None
+# ========== Regulations/Sources ==========
 
 @app.get("/api/v1/regulations", dependencies=[Depends(require_api_key)])
 async def list_all_regulations():
@@ -720,28 +746,74 @@ async def delete_regulation(regulation_id: str):
 
 @app.post("/api/v1/regulations/trigger-checks", dependencies=[Depends(require_api_key)])
 async def trigger_regulation_checks():
-    """Manually trigger AI checks for all regulations (async background job)"""
+    """Manually trigger AI checks for all regulations (scrapes and analyzes)"""
     try:
-        # Get all regulations
-        result = sb.table("regulations").select("*").execute()
-        regulations = result.data if result.data else []
-        
-        # TODO: Implement actual AI checking logic here
-        # For now, we'll just mark all as pending
-        for reg in regulations:
-            sb.table("regulations").update({
-                "status": "pending",
-                "last_checked": datetime.utcnow().isoformat()
-            }).eq("id", reg["id"]).execute()
+        # Run the scraper job asynchronously
+        results = await process_all_regulations()
         
         return JSONResponse(
             status_code=202,
             content={
-                "message": "Regulation checks triggered",
-                "count": len(regulations),
+                "ok": True,
+                "message": f"Processed {len(results)} regulations",
+                "count": len(results),
+                "results": results,
                 "timestamp": datetime.utcnow().isoformat()
             }
         )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/regulations/{regulation_id}/scrape", dependencies=[Depends(require_api_key)])
+async def scrape_single_regulation(regulation_id: str):
+    """Scrape and analyze a single regulation"""
+    try:
+        # Get the regulation
+        result = sb.table("regulations").select("*").eq("id", regulation_id).limit(1).execute()
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Regulation not found")
+        
+        regulation = result.data[0]
+        
+        # Process it
+        analysis_result = await process_single_regulation(regulation)
+        
+        # Update database
+        update_data = {
+            'content': analysis_result.get('content'),
+            'title': analysis_result.get('title'),
+            'status': analysis_result.get('status'),
+            'status_message': analysis_result.get('status_message'),
+            'last_checked': analysis_result.get('last_checked'),
+            'updated_at': datetime.utcnow().isoformat()
+        }
+        
+        sb.table("regulations").update(update_data).eq("id", regulation_id).execute()
+        
+        return {
+            "ok": True,
+            "regulation_id": regulation_id,
+            "status": analysis_result.get('status'),
+            "message": analysis_result.get('status_message')
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/regulations/scrape-all", dependencies=[Depends(require_api_key)])
+async def scrape_all_regulations_endpoint():
+    """Scrape and analyze all regulations (runs in background)"""
+    try:
+        # Run the scraper job asynchronously
+        results = await process_all_regulations()
+        
+        return {
+            "ok": True,
+            "message": f"Processed {len(results)} regulations",
+            "results": results,
+            "timestamp": datetime.utcnow().isoformat()
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -757,208 +829,3 @@ async def log_requests(request: Request, call_next):
     except Exception as e:
         print(f"❌ {request.method} {request.url.path} -> ERROR: {e}")
         raise
-
-class QuestionnaireSubmission(BaseModel):
-    client_id: str
-    answers: dict
-    company_legal_name: Optional[str] = None
-    fintrac_reg_number: Optional[str] = None
-
-@app.post("/api/v1/onboarding-questionnaires", dependencies=[Depends(require_api_key)])
-async def submit_questionnaire(submission: QuestionnaireSubmission):
-    """Create or update onboarding questionnaire submission"""
-    try:
-        # Check if questionnaire already exists for this client
-        existing = sb.table("onboarding_questionnaires").select("id").eq("client_id", submission.client_id).limit(1).execute()
-        
-        questionnaire_data = {
-            "client_id": submission.client_id,
-            "answers": submission.answers,
-            "company_legal_name": submission.company_legal_name,
-            "fintrac_reg_number": submission.fintrac_reg_number,
-            "submitted_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat()
-        }
-        
-        if existing.data:
-            # Update existing questionnaire
-            result = sb.table("onboarding_questionnaires").update(questionnaire_data).eq("client_id", submission.client_id).execute()
-        else:
-            # Create new questionnaire
-            result = sb.table("onboarding_questionnaires").insert(questionnaire_data).execute()
-        
-        if not result.data:
-            raise HTTPException(status_code=500, detail="Failed to save questionnaire")
-        
-        # Also update the client's onboarding_data field for easy access
-        sb.table("clients").update({
-            "onboarding_data": submission.answers,
-            "updated_at": datetime.utcnow().isoformat()
-        }).eq("id", submission.client_id).execute()
-        
-        return {"ok": True, "data": result.data[0]}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ========== Client Users Management ==========
-
-class ClientUserRequest(BaseModel):
-    client_id: str
-    email: str
-    full_name: str
-    password: str
-    role: str = "client"  # client, manager, admin
-
-@app.post("/api/v1/admin/users", dependencies=[Depends(require_api_key)])
-async def create_client_user(user: ClientUserRequest):
-    """Create a new client user account (Admin only)"""
-    try:
-        # Validate role
-        if user.role not in ["client", "manager", "admin"]:
-            raise HTTPException(status_code=400, detail="Invalid role. Must be 'client', 'manager', or 'admin'")
-        
-        # Check if client exists
-        client_check = sb.table("clients").select("id").eq("id", user.client_id).limit(1).execute()
-        if not client_check.data:
-            raise HTTPException(status_code=404, detail="Client not found")
-        
-        # Check if user with this email already exists
-        existing_user = sb.table("client_users").select("id,email").eq("email", user.email).limit(1).execute()
-        if existing_user.data:
-            raise HTTPException(status_code=409, detail="User with this email already exists")
-        
-        # Hash the password
-        password_hash = bcrypt.hashpw(user.password.encode(), bcrypt.gensalt()).decode()
-        
-        # Create the user
-        user_data = {
-            "client_id": user.client_id,
-            "email": user.email.strip().lower(),
-            "full_name": user.full_name.strip(),
-            "password_hash": password_hash,
-            "role": user.role,
-            "is_active": True,
-            "created_at": datetime.utcnow().isoformat()
-        }
-        
-        result = sb.table("client_users").insert(user_data).execute()
-        
-        if not result.data:
-            raise HTTPException(status_code=500, detail="Failed to create user")
-        
-        # Return user info without password hash
-        created_user = result.data[0]
-        return {
-            "id": created_user.get("id"),
-            "client_id": created_user.get("client_id"),
-            "email": created_user.get("email"),
-            "full_name": created_user.get("full_name"),
-            "role": created_user.get("role"),
-            "is_active": created_user.get("is_active"),
-            "created_at": created_user.get("created_at")
-        }
-        
-    except HTTPException:
-        raise
-    except APIError as e:
-        err_msg = str(e)
-        if "duplicate key" in err_msg.lower() or "unique" in err_msg.lower():
-            raise HTTPException(status_code=409, detail="User with this email already exists")
-        raise HTTPException(status_code=500, detail=f"Database error: {err_msg}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/v1/admin/users", dependencies=[Depends(require_api_key)])
-async def list_client_users(client_id: Optional[str] = None):
-    """List all client users, optionally filtered by client_id"""
-    try:
-        query = sb.table("client_users").select("id,client_id,email,full_name,role,is_active,created_at,last_login")
-        
-        if client_id:
-            query = query.eq("client_id", client_id)
-        
-        result = query.execute()
-        return result.data if result.data else []
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/v1/admin/users/{user_id}", dependencies=[Depends(require_api_key)])
-async def get_client_user(user_id: str):
-    """Get a specific client user by ID"""
-    try:
-        result = sb.table("client_users").select("id,client_id,email,full_name,role,is_active,created_at,last_login").eq("id", user_id).limit(1).execute()
-        if not result.data:
-            raise HTTPException(status_code=404, detail="User not found")
-        return result.data[0]
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.put("/api/v1/admin/users/{user_id}", dependencies=[Depends(require_api_key)])
-async def update_client_user(user_id: str, updates: dict):
-    """Update a client user (email, full_name, role, is_active, password)"""
-    try:
-        # Check if user exists
-        existing = sb.table("client_users").select("id").eq("id", user_id).limit(1).execute()
-        if not existing.data:
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        update_data = {}
-        
-        # Handle password update separately (needs hashing)
-        if "password" in updates:
-            password_hash = bcrypt.hashpw(updates["password"].encode(), bcrypt.gensalt()).decode()
-            update_data["password_hash"] = password_hash
-        
-        # Handle other fields
-        allowed_fields = ["email", "full_name", "role", "is_active"]
-        for field in allowed_fields:
-            if field in updates:
-                update_data[field] = updates[field]
-        
-        if not update_data:
-            raise HTTPException(status_code=400, detail="No valid fields provided to update")
-        
-        update_data["updated_at"] = datetime.utcnow().isoformat()
-        
-        result = sb.table("client_users").update(update_data).eq("id", user_id).execute()
-        if not result.data:
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        # Return without password hash
-        updated_user = result.data[0]
-        return {
-            "id": updated_user.get("id"),
-            "client_id": updated_user.get("client_id"),
-            "email": updated_user.get("email"),
-            "full_name": updated_user.get("full_name"),
-            "role": updated_user.get("role"),
-            "is_active": updated_user.get("is_active"),
-            "updated_at": updated_user.get("updated_at")
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/api/v1/admin/users/{user_id}", dependencies=[Depends(require_api_key)])
-async def delete_client_user(user_id: str):
-    """Soft delete a client user by setting is_active=false"""
-    try:
-        existing = sb.table("client_users").select("id").eq("id", user_id).limit(1).execute()
-        if not existing.data:
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        sb.table("client_users").update({
-            "is_active": False,
-            "updated_at": datetime.utcnow().isoformat()
-        }).eq("id", user_id).execute()
-        
-        return {"ok": True, "message": "User deactivated"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
